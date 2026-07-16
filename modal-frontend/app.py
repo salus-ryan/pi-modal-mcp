@@ -327,14 +327,27 @@ def web():
 
         # Workspace integration: read file context, write results back
         workspace_path = req.get("workspace_path", "")
+        workspace_files = req.get("workspace_files", "")  # comma-separated multi-file context
         workspace_context = ""
-        if workspace_path:
+        ws_files_read = []
+        if workspace_files:
+            for fp in [f.strip() for f in workspace_files.split(",") if f.strip()]:
+                try:
+                    ws_result = await workspace.remote.aio("read", path=fp)
+                    if "content" in ws_result:
+                        workspace_context += f"\n\n## Current code in {fp}:\n```python\n{ws_result['content']}```\n"
+                        ws_files_read.append(fp)
+                except Exception:
+                    pass
+        elif workspace_path:
             try:
                 ws_result = await workspace.remote.aio("read", path=workspace_path)
                 if "content" in ws_result:
                     workspace_context = f"\n\n## Current code in {workspace_path}:\n```python\n{ws_result['content']}```\n"
+                    ws_files_read.append(workspace_path)
             except Exception:
                 pass
+        write_path = workspace_path or (ws_files_read[0] if ws_files_read else "")
 
         # Frontier model config (speculative verification)
         frontier_base = req.get("frontier_base_url") or req.get("frontier_api_base", "")
@@ -346,6 +359,7 @@ def web():
             "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
             "critic": "You are a senior code reviewer. Review the candidates and conflicts below, resolve the conflicts, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
             "tester": "You are a test engineer. Given a task, write Python assert statements that verify the solution is correct. Output ONLY assert statements, no function definitions.",
+            "security": "You are a security engineer. Review the code for injection, path traversal, unsafe eval/exec, and other vulnerabilities. If safe, output it unchanged. If unsafe, output the fixed version. Output ONLY the Python code.",
         }
 
         def extract_code(text):
@@ -447,7 +461,19 @@ def web():
                             "delta_changed": False, "frontier_model": frontier_model})
                         yield f"data: {json.dumps({'event':'frontier_accepted','round':round_num,'model':frontier_model,'delta':False})}\n\n"
 
-                # Phase 6: Verify — run code + tests in sandbox
+                # Phase 6: Security review (security role checks for vulnerabilities)
+                yield f"data: {json.dumps({'event':'security_review_start','round':round_num})}\n\n"
+                sec_result = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['security']}\n\n## Code to review\n{code}", max_new)
+                sec_code = extract_code(sec_result["completion"])
+                if sec_code != code:
+                    blackboard["security_correction"] = {"round": round_num, "changed": True, "original": code[:200], "corrected": sec_code[:200]}
+                    code = sec_code
+                    yield f"data: {json.dumps({'event':'security_corrected','round':round_num})}\n\n"
+                else:
+                    blackboard["security_correction"] = {"round": round_num, "changed": False}
+                    yield f"data: {json.dumps({'event':'security_passed','round':round_num})}\n\n"
+
+                # Phase 7: Verify — run code + tests in sandbox
                 full_code = code + "\n\n# --- tests ---\n" + test_code
                 yield f"data: {json.dumps({'event':'verify_start','round':round_num,'code':code[:200],'tests':test_code[:200]})}\n\n"
                 result = await execute_code.remote.aio(full_code, timeout=10)
@@ -457,11 +483,11 @@ def web():
                 if result["passed"]:
                     blackboard["halted"] = True; blackboard["halt_reason"] = "verified"
                     # Write corrected code back to workspace
-                    if workspace_path:
+                    if write_path:
                         try:
-                            await workspace.remote.aio("snapshot", path=workspace_path)
-                            await workspace.remote.aio("write", path=workspace_path, content=code)
-                            yield f"data: {json.dumps({'event':'workspace_applied','round':round_num,'path':workspace_path})}\n\n"
+                            await workspace.remote.aio("snapshot", path=write_path)
+                            await workspace.remote.aio("write", path=write_path, content=code)
+                            yield f"data: {json.dumps({'event':'workspace_applied','round':round_num,'path':write_path})}\n\n"
                         except Exception as e:
                             yield f"data: {json.dumps({'event':'workspace_error','round':round_num,'error':str(e)})}\n\n"
                     if coalition_selected:
