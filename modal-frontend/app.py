@@ -139,7 +139,7 @@ def web():
         "codeqwen-7b": "Qwen/CodeQwen1.5-7B-Chat",
         "codeqwen": "Qwen/CodeQwen1.5-7B-Chat",
         "codegen-350M": "Qwen/CodeQwen1.5-7B-Chat",
-        "codegen-350M-mono": "Qwen/CodeQwen1.5-7B-Chat",
+        "cognition": "Qwen/CodeQwen1.5-7B-Chat",
         "bloom-560m": "bigscience/bloom-560m",
         "bloom": "bigscience/bloom-560m",
         "gpt2": "gpt2",
@@ -154,6 +154,63 @@ def web():
         max_new = int(req.get("max_tokens", req.get("max_new_tokens", 256)))
         n = int(req.get("n", 1))
         stream = bool(req.get("stream", False))
+
+        # Cognition mode: if model is 'cognition', run the full 7-phase loop
+        if model_alias == "cognition":
+            import re as _re
+            def _msg_content(msg):
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    return " ".join(b.get("text","") for b in c if isinstance(b,dict) and b.get("type")=="text")
+                return c
+            goal = "\n".join(_msg_content(m) for m in messages if m.get("role") == "user")
+            t0 = time.time()
+            # Run the cognition loop inline (simplified non-streaming version)
+            ids_cog = [model_id]
+            ROLE = {
+                "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code.",
+                "critic": "You are a senior code reviewer. Review candidates, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+                "tester": "You are a test engineer. Write assert statements that verify correctness. Output ONLY assert statements.",
+                "security": "You are a security engineer. Review for vulnerabilities. If safe, output unchanged. If unsafe, output the fixed version. Output ONLY the Python code.",
+            }
+            def _extract(text):
+                m = _re.search(r'```(?:python)?\s*\n?(.*?)```', text, _re.DOTALL)
+                return m.group(1).strip() if m else text.strip()
+            # Phase 1: generate candidates
+            n_cog = max(1, min(int(req.get("n", 2)), 4))
+            max_new_cog = int(req.get("max_tokens", 256))
+            cog_tasks = [llm_worker.remote.aio(model_id, f"{ROLE['coder']}\n\n## Task\n{goal}", max_new_cog) for _ in range(n_cog)]
+            cands = await asyncio.gather(*cog_tasks, return_exceptions=True)
+            cand_text = "\n\n---\n\n".join(f"### Candidate {i+1}:\n{c.get('completion','[error]')}" if not isinstance(c,Exception) else f"### Candidate {i+1}: [error]" for i,c in enumerate(cands))
+            # Phase 2: critique + synthesize
+            synth = await llm_worker.remote.aio(model_id, f"{ROLE['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:", max_new_cog)
+            code = _extract(synth.get("completion",""))
+            # Phase 3: test generation
+            tests = await llm_worker.remote.aio(model_id, f"{ROLE['tester']}\n\n## Task\n{goal}", max_new_cog)
+            test_code = _extract(tests.get("completion",""))
+            # Phase 4: security review
+            sec = await llm_worker.remote.aio(model_id, f"{ROLE['security']}\n\n## Code\n{code}", max_new_cog)
+            code = _extract(sec.get("completion",code))
+            # Phase 5: verify
+            full_code = code + "\n\n# --- tests ---\n" + test_code
+            result = await execute_code.remote.aio(full_code, timeout=10)
+            elapsed = round(time.time()-t0, 1)
+            content = json.dumps({"code": code, "tests": test_code, "verified": result["passed"],
+                                  "stdout": result["stdout"][:200], "stderr": result["stderr"][:200],
+                                  "elapsed": elapsed, "candidates": n_cog})
+            if stream:
+                from fastapi.responses import StreamingResponse
+                async def gen():
+                    chunk = {"id":"cog","object":"chat.completion.chunk","created":int(t0),"model":"cognition",
+                             "choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield f"data: {json.dumps({'id':'cog','object':'chat.completion.chunk','created':int(t0),'model':'cognition','choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n"
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(gen(), media_type="text/event-stream")
+            return {"id":"cog","object":"chat.completion","created":int(t0),"model":"cognition",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
+
         # Format messages into a single prompt (simple chat template).
         parts = []
         for msg in messages:
