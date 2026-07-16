@@ -310,6 +310,11 @@ def web():
         max_new = int(req.get("max_new_tokens", 256))
         ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
 
+        # Frontier model config (speculative verification)
+        frontier_base = req.get("frontier_base_url") or req.get("frontier_api_base", "")
+        frontier_key = req.get("frontier_api_key", "")
+        frontier_model = req.get("frontier_model", "")
+
         ROLE_PROMPTS = {
             "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code, no markdown.",
             "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
@@ -338,7 +343,7 @@ def web():
 
         blackboard = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
                       "conflicts": [], "constraints": [], "verifications": [], "tests": [],
-                      "synthesis": None, "halted": False, "halt_reason": None}
+                      "synthesis": None, "delta": None, "halted": False, "halt_reason": None}
         t0 = time.time()
 
         async def generate():
@@ -389,7 +394,24 @@ def web():
                 blackboard["synthesis"] = code
                 yield f"data: {json.dumps({'event':'synthesize','round':round_num,'content':code[:500]})}\n\n"
 
-                # Phase 5: Verify — run code + tests in sandbox
+                # Phase 5: Frontier verification (speculative decoding at semantic action level)
+                if frontier_base and frontier_key and frontier_model:
+                    yield f"data: {json.dumps({'event':'frontier_verify_start','round':round_num,'model':frontier_model})}\n\n"
+                    frontier_result = await frontier_verify.remote.aio(
+                        frontier_base, frontier_key, frontier_model,
+                        "You are a code verifier. Review the solution below. If correct, output it unchanged. If incorrect, output the corrected version. Output ONLY the Python code.",
+                        f"## Task\n{goal}\n\n## Proposed solution\n{code}"
+                    )
+                    frontier_code = extract_code(frontier_result["content"])
+                    if frontier_code != code:
+                        blackboard["delta"] = {"round": round_num, "changed": True, "original": code[:200], "corrected": frontier_code[:200]}
+                        code = frontier_code  # use the frontier-corrected version
+                        yield f"data: {json.dumps({'event':'frontier_corrected','round':round_num,'model':frontier_model,'delta':True})}\n\n"
+                    else:
+                        blackboard["delta"] = {"round": round_num, "changed": False}
+                        yield f"data: {json.dumps({'event':'frontier_accepted','round':round_num,'model':frontier_model,'delta':False})}\n\n"
+
+                # Phase 6: Verify — run code + tests in sandbox
                 full_code = code + "\n\n# --- tests ---\n" + test_code
                 yield f"data: {json.dumps({'event':'verify_start','round':round_num,'code':code[:200],'tests':test_code[:200]})}\n\n"
                 result = await execute_code.remote.aio(full_code, timeout=10)
@@ -550,19 +572,23 @@ def build_mcp():
         return json.dumps(result)
 
     @mcp_server.tool()
-    async def modal_cognition(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_rounds: int = 3, max_new_tokens: int = 256) -> str:
-        """Run the full swarm cognition loop with test generation and conflict detection.
+    async def modal_cognition(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_rounds: int = 3, max_new_tokens: int = 256, frontier_base_url: str = "", frontier_api_key: str = "", frontier_model: str = "") -> str:
+        """Run the full swarm cognition loop with test generation, conflict detection, and frontier verification.
+
+        Speculative decoding at the semantic action level: the cheap OSS swarm
+        proposes; a frontier model (if configured) verifies and corrects.
+        The correction delta is the learning signal.
 
         Each round:
         1. N workers (planner/coder) generate candidates in parallel.
-        2. Conflicts detected via difflib (where candidates disagree).
+        2. Conflicts detected via difflib.
         3. Tester role generates assert-based test cases.
-        4. Critic reviews candidates + conflicts, synthesizes ONE canonical answer.
-        5. Code + tests executed in sandbox. If passes -> halt 'verified'.
-           If fails -> error fed back as constraint, next round revises.
+        4. Critic reviews candidates + conflicts, synthesizes ONE answer.
+        5. Frontier model (if configured) verifies/corrects the synthesis.
+        6. Code + tests executed in sandbox. If passes -> halt 'verified'.
 
         Returns JSON: the SCL-inspired blackboard with goals, claims, conflicts,
-        constraints, tests, verifications, synthesis, and halt state.
+        constraints, tests, verifications, synthesis, delta, and halt state.
         """
         import re, time, difflib
         ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
@@ -587,7 +613,7 @@ def build_mcp():
             return conflicts
         bb = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
               "conflicts": [], "constraints": [], "verifications": [], "tests": [],
-              "synthesis": None, "halted": False, "halt_reason": None}
+              "synthesis": None, "delta": None, "halted": False, "halt_reason": None}
         t0 = time.time()
         for rnd in range(1, max_rounds + 1):
             bb["round"] = rnd
@@ -620,6 +646,18 @@ def build_mcp():
             synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}{conflict_text}\n\n## Final solution:", max_new_tokens)
             code = extract_code(synth["completion"])
             bb["synthesis"] = code
+            # Frontier verification (speculative decoding at semantic action level)
+            if frontier_base_url and frontier_api_key and frontier_model:
+                fr = await frontier_verify.remote.aio(
+                    frontier_base_url, frontier_api_key, frontier_model,
+                    "You are a code verifier. Review the solution. If correct, output unchanged. If incorrect, output the corrected version. Output ONLY Python code.",
+                    f"## Task\n{goal}\n\n## Proposed solution\n{code}")
+                frontier_code = extract_code(fr["content"])
+                if frontier_code != code:
+                    bb["delta"] = {"round": rnd, "changed": True, "original": code[:200], "corrected": frontier_code[:200]}
+                    code = frontier_code
+                else:
+                    bb["delta"] = {"round": rnd, "changed": False}
             # Verify: run code + tests
             full_code = code + "\n\n# --- tests ---\n" + test_code
             result = await execute_code.remote.aio(full_code, timeout=10)
@@ -783,6 +821,34 @@ def llm_worker_stream(model_id: str, prompt: str, max_new_tokens: int = 256):
     thread.join()
     MODEL_VOL.commit()
     yield {"done": True, "elapsed": round(time.time() - t0, 3), "model": model_id}
+
+
+@app.function(image=base_image, timeout=120)
+async def frontier_verify(api_base: str, api_key: str, model: str, system_prompt: str, user_prompt: str) -> dict:
+    """Call a frontier model via an OpenAI-compatible API to verify/correct the swarm's synthesis.
+
+    This is the 'speculative decoding at the semantic action level' pattern:
+    the cheap swarm proposes; the frontier model verifies and corrects.
+    The correction delta is the learning signal.
+    """
+    import urllib.request, json
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 512,
+        "temperature": 0.3,
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        result = json.loads(r.read())
+    return {"model": model, "content": result["choices"][0]["message"]["content"]}
 
 
 @app.function(image=modal.Image.debian_slim(python_version="3.11"), timeout=60, cpu=1, memory=512)
