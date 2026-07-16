@@ -612,6 +612,10 @@ def web():
         limit = int(req.get("limit", 50))
         return await delta_store.remote.aio("read", limit=limit)
 
+    @api.get("/api/deltas/export")
+    async def deltas_export():
+        return await delta_store.remote.aio("export")
+
     # --- Repository workspace ---
     @api.get("/api/workspace")
     async def workspace_list():
@@ -944,10 +948,11 @@ def build_mcp():
         Actions:
         - 'stats': return aggregate stats (total, corrected, accepted, correction_rate, by_coalition)
         - 'read': return the most recent delta entries (swarm_proposal vs frontier_correction pairs)
+        - 'export': return preference pairs (goal, proposal, correction) for fine-tuning
 
         This is the learning signal: every time the frontier model corrects the swarm,
         the (proposal, correction) pair is recorded. Over time, this builds a preference
-        dataset for fine-tuning. The swarm literally learns from the frontier.
+        dataset for fine-tuning. The 'export' action formats these as training pairs.
         """
         result = await delta_store.remote.aio(action, limit=limit)
         return json.dumps(result)
@@ -1270,6 +1275,27 @@ def delta_store(action: str = "read", record: dict = None, limit: int = 50) -> d
                 except:
                     pass
         return {"deltas": deltas[-limit:], "total": len(deltas)}
+
+    elif action == "export":
+        # Export deltas as fine-tuning preference pairs (goal, proposal, correction)
+        if not os.path.exists(path):
+            return {"pairs": [], "total": 0}
+        pairs = []
+        with open(path) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get("delta_changed"):
+                        pairs.append({
+                            "goal": d.get("goal", ""),
+                            "proposal": d.get("proposal", ""),
+                            "correction": d.get("correction", ""),
+                            "coalition": d.get("coalition", ""),
+                            "frontier_model": d.get("frontier_model", ""),
+                        })
+                except:
+                    pass
+        return {"pairs": pairs, "total": len(pairs), "format": "preference_pairs"}
 
     elif action == "stats":
         if not os.path.exists(path):
