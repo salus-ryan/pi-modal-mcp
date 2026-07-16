@@ -657,6 +657,30 @@ def web():
     async def workspace_git_status():
         return await workspace.remote.aio("git_status")
 
+    # --- System dashboard: full state in one call ---
+    @api.get("/api/status")
+    async def system_status():
+        delta_stats = await delta_store.remote.aio("stats")
+        coalition_stats = await coalition_store.remote.aio("read")
+        ws_files = await workspace.remote.aio("list")
+        git_log = await workspace.remote.aio("git_log")
+        return {
+            "version": "1.5.0",
+            "models": list(MODEL_ALIASES.keys()),
+            "default_model": DEFAULT_MODEL,
+            "cognition_phases": ["generate", "conflict_detect", "test_generate", "critique", "frontier_verify", "security_review", "sandbox_verify"],
+            "roles": ["planner", "coder", "critic", "tester", "security"],
+            "mcp_tools": 12,
+            "delta_stats": delta_stats,
+            "coalition_stats": coalition_stats,
+            "workspace_files": ws_files.get("files", []),
+            "git_log": git_log.get("log", ""),
+            "endpoints": ["/api/ping", "/api/swarm", "/api/swarm/stream", "/api/synthesize",
+                          "/api/cognition", "/api/verify", "/api/coalition", "/api/coalition/select",
+                          "/api/deltas", "/api/deltas/read", "/api/workspace", "/api/workspace/git/*",
+                          "/v1/chat/completions", "/v1/models", "/ide", "/api/status"],
+        }
+
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
