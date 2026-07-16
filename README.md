@@ -31,8 +31,9 @@ Modal frontend  ── FastAPI + MCP-over-HTTP
 | Tool | Does |
 |---|---|
 | `modal_ping` | Health-check the Modal frontend. |
-| `modal_models` | Fan out N parallel workers on Modal. Returns JSON: concurrent count, elapsed seconds, per-worker results. |
+| `modal_models` | Fan out N parallel CPU workers on Modal. Returns JSON: concurrent count, elapsed seconds, per-worker results. |
 | `modal_browse` | Open a URL in headless Chromium inside a Modal container. Returns a PNG screenshot (MCP image content). |
+| `modal_swarm` | Run a prompt across N parallel **OSS model workers on Modal GPUs** (a model swarm). Returns JSON: `{concurrent, elapsed, results:[{model, completion, elapsed}]}`. Models are HuggingFace IDs (default `Salesforce/codegen-350M-mono`), cached in a shared Modal Volume. |
 
 ## Deploy the Modal app
 
@@ -179,6 +180,23 @@ The pi `mcp-runtime` extension supports both backends from one config:
 
 Remote transport means pi needs **zero local component** for cloud-hosted MCP
 servers — no shim, no `npx`/Python process to spawn.
+
+## AI-native IDE (model swarm)
+
+The app serves a web IDE at `/ide` on the web URL: a Monaco editor whose
+"Run swarm" button fans the current buffer across N parallel OSS model workers
+on Modal GPUs and shows each completion in a side panel. This is the
+self-hosted, OSS-brain equivalent of a cloud coding agent &mdash; local UI,
+remote GPUs, no API keys.
+
+```
+https://YOUR-WORKSPACE--pi-frontend-web.modal.run/ide
+```
+
+Models default to `Salesforce/codegen-350M-mono` (small, fast, public) and are
+cached in a shared Modal Volume so cold starts after the first only pay the
+model-load cost. Pass any HuggingFace ID in the `models` field; gated models
+need a `secrets=[modal.Secret.from_name("huggingface-secret")]` on `llm_worker`.
 
 ## How many models can I run simultaneously?
 

@@ -16,13 +16,50 @@ pw_image = (
     .run_commands("playwright install chromium --with-deps")
 )
 
+# LLM image: torch + transformers for OSS model inference on GPU.
+llm_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.5.1", "transformers==4.46.3")
+)
+
+MODEL_VOL = modal.Volume.from_name("pi-frontend-models", create_if_missing=True)
+DEFAULT_MODEL = "Salesforce/codegen-350M-mono"
+
+
+class _NoGetStream:
+    """ASGI middleware: 405 GET on the MCP path so stateless clients use POST-inline.
+
+    A stateless server has no persistent SSE stream to offer, so advertising one
+    (200 GET that holds open) makes strict clients (e.g. the MCP Node SDK) block
+    on a listening stream that never delivers. Returning 405 tells them to skip
+    the GET stream and use POST-inline responses, which is correct for stateless.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") in ("/mcp", "/mcp/")
+        ):
+            body = b"GET stream disabled; use POST (stateless mode)"
+            await send({"type": "http.response.start", "status": 405,
+                        "headers": [[b"content-type", b"text/plain"],
+                                    [b"content-length", str(len(body)).encode()],
+                                    [b"allow", b"POST"]]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
 
 @app.function(image=base_image)
 @modal.asgi_app()
 def web():
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, Response, JSONResponse
-    import asyncio, time
+    from fastapi.responses import HTMLResponse, Response
+    import asyncio, time, json
 
     api = FastAPI(title="pi-frontend")
 
@@ -33,6 +70,8 @@ def web():
 <li><a href=/api/time>/api/time</a></li>
 <li><a href=/api/models?n=3>/api/models?n=3</a> - parallel fan-out</li>
 <li><a href=/api/browse?url=example.com>/api/browse?url=example.com</a> - headless screenshot (PNG)</li>
+<li><a href=/api/swarm>/api/swarm</a> (POST) - model swarm</li>
+<li><a href=/ide>/ide</a> - AI-native IDE powered by Modal model swarm</li>
 </ul></body></html>"""
 
     @api.get("/", response_class=HTMLResponse)
@@ -64,36 +103,31 @@ def web():
         return Response(content=png, media_type="image/png",
                         headers={"X-Elapsed-Seconds": f"{round(time.time()-t0,3)}"})
 
-    # --- Modal-hosted MCP server (streamable HTTP transport) ---
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.utilities.types import Image
-
-    mcp_server = FastMCP("pi-frontend-mcp")
-
-    @mcp_server.tool()
-    async def modal_ping() -> str:
-        """Health-check the Modal frontend."""
-        return "pi-frontend is up"
-
-    @mcp_server.tool()
-    async def modal_models(n: int = 3) -> str:
-        """Fan out N parallel workers on Modal. Returns JSON with elapsed time and per-worker results."""
-        n = max(1, min(n, 64))
+    @api.post("/api/swarm")
+    async def swarm(req: dict):
+        prompt = req.get("prompt", "")
+        models = req.get("models", DEFAULT_MODEL)
+        n = max(1, min(int(req.get("n", 3)), 16))
+        max_new = int(req.get("max_new_tokens", 256))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
         t0 = time.time()
-        tasks = [run_model.remote.aio(f"model-{i}") for i in range(n)]
-        results = await asyncio.gather(*tasks)
-        import json
-        return json.dumps({"concurrent": n, "elapsed": round(time.time()-t0, 3), "results": results})
+        tasks = [llm_worker.remote.aio(m, prompt, max_new) for m in workers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out = []
+        for m, r in zip(workers, results):
+            if isinstance(r, Exception):
+                out.append({"model": m, "error": str(r)})
+            else:
+                out.append(r)
+        return {"concurrent": n, "elapsed": round(time.time() - t0, 3), "results": out}
 
-    @mcp_server.tool()
-    async def modal_browse(url: str) -> Image:
-        """Open a URL in a headless Chromium browser inside a Modal container and return a PNG screenshot."""
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-        png = await browse_page.remote.aio(url)
-        return Image(data=png, format="png")
+    @api.get("/ide", response_class=HTMLResponse)
+    def ide():
+        return IDE_HTML
 
-    api.mount("/mcp", mcp_server.streamable_http_app())
+    # --- Modal-hosted MCP server (mounted) ---
+    api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
     return api
 
@@ -102,6 +136,11 @@ def web():
 @modal.asgi_app()
 def mcp_web():
     """Dedicated MCP-over-HTTP endpoint. Serves tools at /mcp."""
+    return _NoGetStream(build_mcp().streamable_http_app())
+
+
+def build_mcp():
+    """Build a configured FastMCP server with all tools. Used by web() and mcp_web()."""
     from mcp.server.fastmcp import FastMCP
     from mcp.server.fastmcp.utilities.types import Image
     import asyncio, time, json
@@ -124,7 +163,7 @@ def mcp_web():
         t0 = time.time()
         tasks = [run_model.remote.aio(f"model-{i}") for i in range(n)]
         results = await asyncio.gather(*tasks)
-        return json.dumps({"concurrent": n, "elapsed": round(time.time()-t0, 3), "results": results})
+        return json.dumps({"concurrent": n, "elapsed": round(time.time() - t0, 3), "results": results})
 
     @mcp_server.tool()
     async def modal_browse(url: str) -> Image:
@@ -134,35 +173,34 @@ def mcp_web():
         png = await browse_page.remote.aio(url)
         return Image(data=png, format="png")
 
-    return _NoGetStream(mcp_server.streamable_http_app())
+    @mcp_server.tool()
+    async def modal_swarm(prompt: str, models: str = DEFAULT_MODEL, n: int = 3, max_new_tokens: int = 256) -> str:
+        """Run a prompt across N parallel OSS model workers on Modal GPUs (a model swarm).
 
+        Args:
+            prompt: The prompt / code to complete.
+            models: Comma-separated HuggingFace model IDs (default Salesforce/codegen-350M-mono).
+                    Workers cycle through the list, so passing 2 models with n=4 runs each twice.
+            n: Number of parallel workers (1-16).
+            max_new_tokens: Max tokens to generate per worker.
 
-class _NoGetStream:
-    """ASGI middleware: 405 GET on the MCP path so stateless clients use POST-inline.
+        Returns JSON: {concurrent, elapsed, results:[{model, completion, elapsed}]}.
+        """
+        n = max(1, min(n, 16))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
+        t0 = time.time()
+        tasks = [llm_worker.remote.aio(m, prompt, max_new_tokens) for m in workers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out = []
+        for m, r in zip(workers, results):
+            if isinstance(r, Exception):
+                out.append({"model": m, "error": str(r)})
+            else:
+                out.append(r)
+        return json.dumps({"concurrent": n, "elapsed": round(time.time() - t0, 3), "results": out})
 
-    A stateless server has no persistent SSE stream to offer, so advertising one
-    (200 GET that holds open) makes strict clients (e.g. the MCP Node SDK) block
-    on a listening stream that never delivers. Returning 405 tells them to skip
-    the GET stream and use POST-inline responses, which is correct for stateless.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if (
-            scope.get("type") == "http"
-            and scope.get("method") == "GET"
-            and scope.get("path") == "/mcp"
-        ):
-            body = b"GET stream disabled; use POST (stateless mode)"
-            await send({"type": "http.response.start", "status": 405,
-                        "headers": [[b"content-type", b"text/plain"],
-                                     [b"content-length", str(len(body)).encode()],
-                                     [b"allow", b"POST"]]})
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.app(scope, receive, send)
+    return mcp_server
 
 
 @app.function(image=base_image)
@@ -176,7 +214,6 @@ def run_model(name: str):
 
 @app.function(image=pw_image, timeout=300)
 async def browse_page(url: str) -> bytes:
-    import asyncio
     from playwright.async_api import async_playwright
 
     async def run():
@@ -190,3 +227,118 @@ async def browse_page(url: str) -> bytes:
             return png
 
     return await run()
+
+
+@app.function(
+    image=llm_image,
+    gpu="A100-80GB",
+    volumes={"/models": MODEL_VOL},
+    timeout=600,
+)
+def llm_worker(model_id: str, prompt: str, max_new_tokens: int = 256) -> dict:
+    """Run a single OSS model inference on a Modal GPU container.
+
+    Models are cached in a shared Modal Volume so cold starts after the first
+    only pay the model-load cost, not the download.
+    """
+    import time, os
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    cache = os.path.join("/models", model_id.replace("/", "_"))
+    tok = AutoTokenizer.from_pretrained(model_id, cache_dir=cache)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, cache_dir=cache, torch_dtype=torch.float16
+    ).to("cuda")
+    model.eval()
+
+    inputs = tok(prompt, return_tensors="pt").to("cuda")
+    t0 = time.time()
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.95,
+            pad_token_id=tok.pad_token_id,
+        )
+    new_tokens = out[0][inputs["input_ids"].shape[1]:]
+    text = tok.decode(new_tokens, skip_special_tokens=True)
+    MODEL_VOL.commit()
+    return {"model": model_id, "completion": text, "elapsed": round(time.time() - t0, 3)}
+
+
+IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>pi-modal-mcp &middot; swarm IDE</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0d1117;color:#e6edf3;height:100vh;display:flex;flex-direction:column}
+  header{background:linear-gradient(90deg,#6366f1,#0ea5e9);padding:10px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  header h1{font-size:15px;color:#fff;font-weight:600}
+  header .sub{font-size:12px;color:#dbeafe}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}
+  .bar label{font-size:11px;color:#dbeafe}
+  .bar input{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:6px;font-size:12px}
+  .bar input[type=number]{width:64px}
+  .bar input[type=text]{width:240px}
+  .bar button{background:#238636;border:1px solid #2ea043;color:#fff;padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+  .bar button:hover{background:#2ea043}
+  .bar button:disabled{opacity:.5;cursor:wait}
+  main{flex:1;display:flex;min-height:0}
+  #editor{flex:1;min-width:0;border-right:1px solid #30363d}
+  #panel{width:42%;min-width:340px;display:flex;flex-direction:column;background:#0d1117}
+  #panel .phead{padding:8px 12px;border-bottom:1px solid #30363d;font-size:12px;color:#8b949e;display:flex;justify-content:space-between}
+  #results{flex:1;overflow:auto;padding:10px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;overflow:hidden}
+  .card .ctitle{background:#21262d;padding:6px 10px;font-size:11px;color:#79c0ff;display:flex;justify-content:space-between;border-bottom:1px solid #30363d}
+  .card .cbody{padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;color:#c9d1d9}
+  .err{color:#f85149}
+  .status{font-size:11px;color:#8b949e}
+</style></head><body>
+<header>
+  <div><h1>&#129418; pi-modal-mcp swarm IDE</h1><div class=sub>self-hosted OSS models on Modal GPUs &middot; <a href=https://github.com/salus-ryan/pi-modal-mcp target=_blank style=color:#dbeafe>repo</a></div></div>
+  <div class=bar>
+    <label>models <input id=models type=text value="Salesforce/codegen-350M-mono" title="comma-separated HuggingFace IDs"></label>
+    <label>n <input id=n type=number value=3 min=1 max=16></label>
+    <label>tokens <input id=tok type=number value=128 min=8 max=1024></label>
+    <button id=run>Run swarm</button>
+  </div>
+</header>
+<main>
+  <div id=editor></div>
+  <div id=panel>
+    <div class=phead><span>swarm results</span><span class=status id=status>idle</span></div>
+    <div id=results><div class=card><div class=cbody style=color:#8b949e>Edit code on the left, then "Run swarm". Each worker runs on its own Modal GPU container; results stream back in parallel.</div></div></div>
+  </div>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+<script>
+require.config({paths:{vs:'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs'}});
+let ed;
+require(['vs/editor/editor.main'],function(){
+  ed=monaco.editor.create(document.getElementById('editor'),{
+    value:'// OSS model swarm on Modal\\n// Edit me, then hit Run swarm.\\n\\ndef fizzbuzz(n):\\n    for i in range(1, n+1):\\n',
+    language:'python',theme:'vs-dark',automaticLayout:true,fontSize:13
+  });
+});
+const $=id=>document.getElementById(id);
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+$('run').onclick=async function(){
+  if(!ed)return;
+  const btn=this;btn.disabled=true;$('status').textContent='running...';
+  const body={prompt:ed.getValue(),models:$('models').value,n:parseInt($('n').value,10),max_new_tokens:parseInt($('tok').value,10)};
+  $('results').innerHTML='<div class=card><div class=cbody style=color:#8b949e>fanning out '+body.n+' worker(s) on Modal GPUs...</div></div>';
+  try{
+    const r=await fetch('/api/swarm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    $('status').textContent='done in '+d.elapsed+'s ('+d.concurrent+' workers)';
+    $('results').innerHTML=d.results.map((x,i)=>'<div class=card><div class=ctitle><span>#'+(i+1)+' '+esc(x.model)+'</span><span>'+(x.elapsed?x.elapsed+'s':'')+'</span></div><div class=cbody'+(x.error?' style=color:#f85149':'')+'>'+esc(x.error||x.completion)+'</div></div>').join('');
+  }catch(e){$('status').textContent='error';$('results').innerHTML='<div class=card><div class=cbody style=color:#f85149>'+esc(String(e))+'</div></div>';}
+  finally{btn.disabled=false;}
+};
+</script>
+</body></html>"""
