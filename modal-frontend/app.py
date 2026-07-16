@@ -126,6 +126,92 @@ def web():
     def ide():
         return IDE_HTML
 
+    # --- OpenAI-compatible chat completions endpoint ---
+    # Lets pi (or any OpenAI-compatible client) use the Modal model swarm as a provider.
+    # Configure in ~/.pi/agent/models.json:
+    #   "swarm": { "baseUrl": "https://...--pi-frontend-web.modal.run/v1",
+    #              "api": "openai-completions", "apiKey": "swarm",
+    #              "models": [{ "id": "codegen-350M", ... }] }
+    MODEL_ALIASES = {
+        "codegen-350M": "Salesforce/codegen-350M-mono",
+        "codegen-350M-mono": "Salesforce/codegen-350M-mono",
+        "bloom-560m": "bigscience/bloom-560m",
+        "bloom": "bigscience/bloom-560m",
+        "gpt2": "gpt2",
+        "distilgpt2": "distilgpt2",
+    }
+
+    @api.post("/v1/chat/completions")
+    async def chat_completions(req: dict):
+        messages = req.get("messages", [])
+        model_alias = req.get("model", "codegen-350M")
+        model_id = MODEL_ALIASES.get(model_alias, model_alias)
+        max_new = int(req.get("max_tokens", req.get("max_new_tokens", 256)))
+        n = int(req.get("n", 1))
+        stream = bool(req.get("stream", False))
+        # Format messages into a single prompt (simple chat template).
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(f"# System\n{content}")
+            elif role == "user":
+                parts.append(f"# User\n{content}")
+            elif role == "assistant":
+                parts.append(f"# Assistant\n{content}")
+        prompt = "\n\n".join(parts) + "\n\n# Assistant\n"
+        t0 = time.time()
+        tasks = [llm_worker.remote.aio(model_id, prompt, max_new) for _ in range(n)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        import uuid
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(t0)
+
+        if stream:
+            from fastapi.responses import StreamingResponse
+            async def generate():
+                for i, r in enumerate(results):
+                    text = r.get("completion", "") if not isinstance(r, Exception) else f"[error: {r}]"
+                    # Send content as a single chunk (not token-by-token, but protocol-compliant).
+                    chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                             "model": model_alias,
+                             "choices": [{"index": i, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    done_chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                                  "model": model_alias,
+                                  "choices": [{"index": i, "delta": {}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(done_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(generate(), media_type="text/event-stream")
+
+        choices = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                text = f"[error: {r}]"
+            else:
+                text = r.get("completion", "")
+            choices.append({
+                "index": i,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            })
+        return {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_alias,
+            "choices": choices,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    @api.get("/v1/models")
+    def list_models():
+        return {"object": "list", "data": [
+            {"id": k, "object": "model", "owned_by": "modal-swarm"}
+            for k in MODEL_ALIASES
+        ]}
+
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
