@@ -1,0 +1,17 @@
+---
+name: Feature request
+about: Suggest a new tool, endpoint, or integration
+labels: ["enhancement"]
+---
+
+## Motivation
+
+<!-- What problem does this solve? -->
+
+## Proposal
+
+<!-- Describe the change: new tool, endpoint, transport, etc. -->
+
+## Alternatives considered
+
+<!-- If any -->

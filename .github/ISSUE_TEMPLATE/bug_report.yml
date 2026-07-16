@@ -1,0 +1,30 @@
+---
+name: Bug report
+about: Something isn't working as expected
+labels: ["bug"]
+---
+
+## Summary
+
+<!-- One-line summary of the problem -->
+
+## Reproduction
+
+```bash
+# Steps + commands to reproduce
+```
+
+## Expected
+
+<!-- What you expected to happen -->
+
+## Actual
+
+<!-- What happened instead; include logs/errors -->
+
+## Environment
+
+- OS:
+- `modal` version:
+- `mcp` version:
+- pi version (if using the pi extension):

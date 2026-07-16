@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modal-mcp"
+version = "0.1.0"
+description = "Stdio MCP shim that exposes a deployed Modal frontend as MCP tools (ping, parallel fan-out, headless browser screenshots)."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "salus-ryan" }]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+modal-mcp = "modal_mcp:main_sync"
+
+[project.urls]
+Homepage = "https://github.com/salus-ryan/pi-modal-mcp"
+Repository = "https://github.com/salus-ryan/pi-modal-mcp"
+Issues = "https://github.com/salus-ryan/pi-modal-mcp/issues"
+
+[tool.setuptools]
+py-modules = ["modal_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

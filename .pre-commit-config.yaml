@@ -1,0 +1,29 @@
+# Pre-commit hooks. Install with: pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(modal-mcp|modal-frontend)/.*\.py$
+      - id: ruff-format
+        files: ^(modal-mcp|modal-frontend)/.*\.py$
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-json
+        files: \.json$
+      - id: check-yaml
+        files: \.(yml|yaml)$
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: check-added-large-files
+  - repo: local
+    hooks:
+      - id: no-secrets
+        name: forbid workspace URLs / tokens
+        entry: bash -c 'if git grep -nE "salus|ryan-barrett|ak-[A-Za-z0-9]{20}|as-[A-Za-z0-9]{20}" -- ":!.git" ; then echo "Refusing commit: workspace URL or token detected."; exit 1; fi'
+        language: system
+        pass_filenames: false
+        stages: [commit]
