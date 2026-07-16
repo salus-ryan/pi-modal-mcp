@@ -325,6 +325,17 @@ def web():
         else:
             yield_init = None
 
+        # Workspace integration: read file context, write results back
+        workspace_path = req.get("workspace_path", "")
+        workspace_context = ""
+        if workspace_path:
+            try:
+                ws_result = await workspace.remote.aio("read", path=workspace_path)
+                if "content" in ws_result:
+                    workspace_context = f"\n\n## Current code in {workspace_path}:\n```python\n{ws_result['content']}```\n"
+            except Exception:
+                pass
+
         # Frontier model config (speculative verification)
         frontier_base = req.get("frontier_base_url") or req.get("frontier_api_base", "")
         frontier_key = req.get("frontier_api_key", "")
@@ -368,7 +379,7 @@ def web():
                 blackboard["round"] = round_num
                 yield f"data: {json.dumps({'event':'round_start','round':round_num,'max_rounds':max_rounds,'elapsed':round(time.time()-t0,1)})}\n\n"
 
-                prompt = goal
+                prompt = goal + workspace_context
                 if blackboard["constraints"]:
                     ct = "\n".join(f"  - {c}" for c in blackboard["constraints"])
                     prompt = f"{goal}\n\n## Previous failures:\n{ct}\n\nFix and write the complete solution."
@@ -445,6 +456,14 @@ def web():
 
                 if result["passed"]:
                     blackboard["halted"] = True; blackboard["halt_reason"] = "verified"
+                    # Write corrected code back to workspace
+                    if workspace_path:
+                        try:
+                            await workspace.remote.aio("snapshot", path=workspace_path)
+                            await workspace.remote.aio("write", path=workspace_path, content=code)
+                            yield f"data: {json.dumps({'event':'workspace_applied','round':round_num,'path':workspace_path})}\n\n"
+                        except Exception as e:
+                            yield f"data: {json.dumps({'event':'workspace_error','round':round_num,'error':str(e)})}\n\n"
                     if coalition_selected:
                         await coalition_store.remote.aio("record", coalition=coalition_selected["coalition"],
                             result={"delta_changed": (blackboard.get("delta") or {}).get("changed",False),"rounds":round_num,"elapsed":round(time.time()-t0,1)})
