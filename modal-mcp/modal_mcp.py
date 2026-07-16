@@ -5,7 +5,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 
-FRONTEND = os.environ.get("MODAL_FRONTEND", "https://ryan-barrett--pi-frontend-web-dev.modal.run")
+FRONTEND = os.environ.get("MODAL_FRONTEND")
+if not FRONTEND:
+    raise SystemExit("modal-mcp: set MODAL_FRONTEND to your deployed web URL, e.g. https://YOUR-WORKSPACE--pi-frontend-web.modal.run")
 
 server = Server("modal-mcp")
 
