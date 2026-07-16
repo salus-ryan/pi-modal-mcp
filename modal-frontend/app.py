@@ -23,7 +23,7 @@ llm_image = (
 )
 
 MODEL_VOL = modal.Volume.from_name("pi-frontend-models", create_if_missing=True)
-DEFAULT_MODEL = "Salesforce/codegen-350M-mono"
+DEFAULT_MODEL = "Qwen/CodeQwen1.5-7B-Chat"
 
 
 class _NoGetStream:
@@ -133,8 +133,10 @@ def web():
     #              "api": "openai-completions", "apiKey": "swarm",
     #              "models": [{ "id": "codegen-350M", ... }] }
     MODEL_ALIASES = {
-        "codegen-350M": "Salesforce/codegen-350M-mono",
-        "codegen-350M-mono": "Salesforce/codegen-350M-mono",
+        "codeqwen-7b": "Qwen/CodeQwen1.5-7B-Chat",
+        "codeqwen": "Qwen/CodeQwen1.5-7B-Chat",
+        "codegen-350M": "Qwen/CodeQwen1.5-7B-Chat",
+        "codegen-350M-mono": "Qwen/CodeQwen1.5-7B-Chat",
         "bloom-560m": "bigscience/bloom-560m",
         "bloom": "bigscience/bloom-560m",
         "gpt2": "gpt2",
@@ -212,6 +214,90 @@ def web():
             for k in MODEL_ALIASES
         ]}
 
+    # --- True streaming swarm: tokens stream independently per worker via SSE ---
+    @api.post("/api/swarm/stream")
+    async def swarm_stream(req: dict):
+        from fastapi.responses import StreamingResponse
+        prompt = req.get("prompt", "")
+        models = req.get("models", DEFAULT_MODEL)
+        n = max(1, min(int(req.get("n", 3)), 8))
+        max_new = int(req.get("max_new_tokens", 128))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
+
+        async def generate():
+            import asyncio
+            # Spawn all workers concurrently; each is a streaming generator.
+            # We interleave their tokens into one SSE stream with worker index tags.
+            queues = [asyncio.Queue() for _ in workers]
+
+            async def run_worker(i, model_id):
+                try:
+                    async for chunk in llm_worker_stream.remote.gen(model_id, prompt, max_new):
+                        await queues[i].put(chunk)
+                except Exception as e:
+                    await queues[i].put({"error": str(e)})
+                finally:
+                    await queues[i].put(None)  # sentinel
+
+            tasks = [asyncio.create_task(run_worker(i, m)) for i, m in enumerate(workers)]
+            done = [False] * n
+            while not all(done):
+                for i in range(n):
+                    if done[i]:
+                        continue
+                    try:
+                        item = queues[i].get_nowait()
+                    except asyncio.QueueEmpty:
+                        continue
+                    if item is None:
+                        done[i] = True
+                        yield f"data: {json.dumps({'worker': i, 'model': workers[i], 'done': True})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'worker': i, 'model': workers[i], **item})}\n\n"
+                await asyncio.sleep(0.01)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    # --- Swarm synthesis: workers produce candidates, then a model critiques + synthesizes ---
+    @api.post("/api/synthesize")
+    async def synthesize(req: dict):
+        prompt = req.get("prompt", "")
+        models = req.get("models", DEFAULT_MODEL)
+        n = max(1, min(int(req.get("n", 3)), 8))
+        max_new = int(req.get("max_new_tokens", 256))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
+        t0 = time.time()
+
+        # Phase 1: N workers generate candidates in parallel
+        tasks = [llm_worker.remote.aio(m, prompt, max_new) for m in workers]
+        candidates = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Phase 2: synthesis — one worker critiques and picks the best parts
+        cand_text = "\n\n---\n\n".join(
+            f"### Candidate {i+1} ({c.get('model','?')}):\n{c.get('completion','[error]')}"
+            if not isinstance(c, Exception) else f"### Candidate {i+1}: [error: {c}]"
+            for i, c in enumerate(candidates)
+        )
+        synth_prompt = (
+            "You are a code review synthesizer. Below are multiple candidate completions "
+            "for the same prompt. Critique each, then produce ONE canonical answer that "
+            "takes the best parts. Output only the final code.\n\n"
+            f"## Original prompt\n{prompt}\n\n## Candidates\n{cand_text}\n\n## Synthesized answer:"
+        )
+        synth = await llm_worker.remote.aio(workers[0], synth_prompt, max_new)
+        return {
+            "elapsed": round(time.time() - t0, 3),
+            "candidates": [
+                c if not isinstance(c, Exception) else {"error": str(c)}
+                for c in candidates
+            ],
+            "synthesis": synth,
+        }
+
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
@@ -265,7 +351,7 @@ def build_mcp():
 
         Args:
             prompt: The prompt / code to complete.
-            models: Comma-separated HuggingFace model IDs (default Salesforce/codegen-350M-mono).
+            models: Comma-separated HuggingFace model IDs (default Qwen/CodeQwen1.5-7B-Chat).
                     Workers cycle through the list, so passing 2 models with n=4 runs each twice.
             n: Number of parallel workers (1-16).
             max_new_tokens: Max tokens to generate per worker.
@@ -285,6 +371,53 @@ def build_mcp():
             else:
                 out.append(r)
         return json.dumps({"concurrent": n, "elapsed": round(time.time() - t0, 3), "results": out})
+
+    @mcp_server.tool()
+    async def modal_swarm_stream(prompt: str, models: str = DEFAULT_MODEL, n: int = 3, max_new_tokens: int = 128) -> str:
+        """Stream a prompt across N parallel OSS model workers, returning all tokens as they generate.
+
+        Unlike modal_swarm (which waits for all workers), this returns a token-by-token
+        view of every worker generating simultaneously. Results are JSONL, one line per token chunk.
+        """
+        n = max(1, min(n, 8))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
+        lines = []
+        async for chunk in llm_worker_stream.remote.gen_aio(workers[0], prompt, max_new_tokens):
+            if "token" in chunk:
+                lines.append(chunk["token"])
+        return "".join(lines)
+
+    @mcp_server.tool()
+    async def modal_synthesize(prompt: str, models: str = DEFAULT_MODEL, n: int = 3, max_new_tokens: int = 256) -> str:
+        """Run a prompt across N parallel OSS model workers, then synthesize one canonical answer.
+
+        Phase 1: N workers generate candidate completions in parallel.
+        Phase 2: A model critiques all candidates and produces ONE synthesized answer.
+
+        Returns JSON: {elapsed, candidates:[...], synthesis:{model, completion, elapsed}}.
+        """
+        n = max(1, min(n, 8))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        workers = [ids[i % len(ids)] for i in range(n)]
+        t0 = time.time()
+        tasks = [llm_worker.remote.aio(m, prompt, max_new_tokens) for m in workers]
+        candidates = await asyncio.gather(*tasks, return_exceptions=True)
+        cand_text = "\n\n---\n\n".join(
+            f"### Candidate {i+1} ({c.get('model','?')}):\n{c.get('completion','[error]')}"
+            if not isinstance(c, Exception) else f"### Candidate {i+1}: [error: {c}]"
+            for i, c in enumerate(candidates)
+        )
+        synth_prompt = (
+            "You are a code review synthesizer. Below are multiple candidate completions "
+            "for the same prompt. Critique each, then produce ONE canonical answer that "
+            "takes the best parts. Output only the final code.\n\n"
+            f"## Original prompt\n{prompt}\n\n## Candidates\n{cand_text}\n\n## Synthesized answer:"
+        )
+        synth = await llm_worker.remote.aio(workers[0], synth_prompt, max_new_tokens)
+        return json.dumps({"elapsed": round(time.time() - t0, 3),
+                           "candidates": [c if not isinstance(c, Exception) else {"error": str(c)} for c in candidates],
+                           "synthesis": synth})
 
     return mcp_server
 
@@ -340,21 +473,82 @@ def llm_worker(model_id: str, prompt: str, max_new_tokens: int = 256) -> dict:
     ).to("cuda")
     model.eval()
 
-    inputs = tok(prompt, return_tensors="pt").to("cuda")
+    # Use chat template if available (instruction-tuned models)
+    if hasattr(tok, "apply_chat_template") and tok.chat_template:
+        messages = [{"role": "user", "content": prompt}]
+        inputs = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to("cuda")
+    else:
+        inputs = tok(prompt, return_tensors="pt").to("cuda")
+
     t0 = time.time()
     with torch.no_grad():
         out = model.generate(
-            **inputs,
+            **inputs if isinstance(inputs, dict) else {"input_ids": inputs},
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.7,
             top_p=0.95,
             pad_token_id=tok.pad_token_id,
         )
-    new_tokens = out[0][inputs["input_ids"].shape[1]:]
+    input_len = inputs["input_ids"].shape[1] if isinstance(inputs, dict) else inputs.shape[1]
+    new_tokens = out[0][input_len:]
     text = tok.decode(new_tokens, skip_special_tokens=True)
     MODEL_VOL.commit()
     return {"model": model_id, "completion": text, "elapsed": round(time.time() - t0, 3)}
+
+
+@app.function(
+    image=llm_image,
+    gpu="A100-80GB",
+    volumes={"/models": MODEL_VOL},
+    timeout=600,
+)
+def llm_worker_stream(model_id: str, prompt: str, max_new_tokens: int = 256):
+    """Generator that yields tokens as they're generated (true streaming).
+
+    Uses transformers TextIteratorStreamer + threading so tokens are produced
+    incrementally rather than all-at-once after generate() finishes.
+    Yields dicts: {"token": str} during generation, {"done": True, "elapsed": float} at end.
+    """
+    import time, os, threading
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+    cache = os.path.join("/models", model_id.replace("/", "_"))
+    tok = AutoTokenizer.from_pretrained(model_id, cache_dir=cache)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, cache_dir=cache, torch_dtype=torch.float16
+    ).to("cuda")
+    model.eval()
+
+    if hasattr(tok, "apply_chat_template") and tok.chat_template:
+        messages = [{"role": "user", "content": prompt}]
+        input_ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to("cuda")
+    else:
+        input_ids = tok(prompt, return_tensors="pt")["input_ids"].to("cuda")
+
+    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+    t0 = time.time()
+    gen_kwargs = {
+        "input_ids": input_ids,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "pad_token_id": tok.pad_token_id,
+        "streamer": streamer,
+    }
+    thread = threading.Thread(target=lambda: model.generate(**gen_kwargs))
+    thread.start()
+
+    for text in streamer:
+        if text:
+            yield {"token": text}
+    thread.join()
+    MODEL_VOL.commit()
+    yield {"done": True, "elapsed": round(time.time() - t0, 3), "model": model_id}
 
 
 IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -388,7 +582,7 @@ IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <header>
   <div><h1>&#129418; pi-modal-mcp swarm IDE</h1><div class=sub>self-hosted OSS models on Modal GPUs &middot; <a href=https://github.com/salus-ryan/pi-modal-mcp target=_blank style=color:#dbeafe>repo</a></div></div>
   <div class=bar>
-    <label>models <input id=models type=text value="Salesforce/codegen-350M-mono" title="comma-separated HuggingFace IDs"></label>
+    <label>models <input id=models type=text value="Qwen/CodeQwen1.5-7B-Chat" title="comma-separated HuggingFace IDs"></label>
     <label>n <input id=n type=number value=3 min=1 max=16></label>
     <label>tokens <input id=tok type=number value=128 min=8 max=1024></label>
     <button id=run>Run swarm</button>
