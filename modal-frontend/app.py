@@ -438,6 +438,22 @@ def web():
                         conflicts.append({"pair": [i, j], "diffs": diffs[:10]})
             return conflicts
 
+        def format_blackboard(bb):
+            """Format the blackboard as SCL context for role prompts."""
+            lines = [f"## Blackboard (SCL shared state)"]
+            lines.append(f"Goal: {bb['goal'][:200]}")
+            lines.append(f"Round: {bb['round']}/{bb['max_rounds']}")
+            if bb.get("constraints"):
+                lines.append("Constraints (past failures):")
+                for c in bb["constraints"][-3:]:
+                    lines.append(f"  - {c[:150]}")
+            if bb.get("synthesis"):
+                lines.append(f"Previous synthesis: {bb['synthesis'][:150]}")
+            if bb.get("delta"):
+                d = bb["delta"]
+                lines.append(f"Frontier delta: {'corrected' if d.get('changed') else 'accepted'}")
+            return "\n".join(lines)
+
         blackboard = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
                       "conflicts": [], "constraints": [], "verifications": [], "tests": [],
                       "synthesis": None, "delta": None, "halted": False, "halt_reason": None}
@@ -454,6 +470,8 @@ def web():
                 if blackboard["constraints"]:
                     ct = "\n".join(f"  - {c}" for c in blackboard["constraints"])
                     prompt = f"{goal}\n\n## Previous failures:\n{ct}\n\nFix and write the complete solution."
+                # Include SCL blackboard context so roles know the full state
+                scl_context = format_blackboard(blackboard) if round_num > 1 else ""
 
                 # Phase 1: Generate candidates (role specialization)
                 candidates = []
@@ -1456,7 +1474,7 @@ def cognition_loop(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_round
             # First worker is planner (if n>1), rest are coders
             role = "planner" if (i == 0 and n > 1) else "coder"
             role_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS["coder"])
-            full_prompt = f"{role_prompt}\n\n## Task\n{prompt}"
+            full_prompt = f"{role_prompt}\n\n{scl_context}\n\n## Task\n{prompt}" if scl_context else f"{role_prompt}\n\n## Task\n{prompt}"
             yield {"event": "generate", "worker": i, "model": ids[i % len(ids)], "role": role, "round": round_num}
             result = llm_worker.remote(ids[i % len(ids)], full_prompt, max_new_tokens)
             candidates.append(result)
