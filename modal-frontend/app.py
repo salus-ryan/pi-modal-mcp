@@ -1604,77 +1604,93 @@ def cognition_loop(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_round
 
 
 IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>pi-modal-mcp &middot; agent</title>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name=apple-mobile-web-app-capable content=yes>
+<meta name=theme-color content=#0a0a0a>
+<title>pi-modal-mcp</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bd:#30363d;--tx:#e6edf3;--tx2:#8b949e;--acc:#58a6ff;--grn:#3fb950;--red:#f85149;--yel:#d29922;--pur:#bc8cff}
-  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--tx);height:100vh;display:flex;flex-direction:column;overflow:hidden}
-  header{background:linear-gradient(90deg,#6366f1,#0ea5e9);padding:8px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
-  header h1{font-size:14px;color:#fff;font-weight:600}
-  header .sub{font-size:11px;color:#dbeafe}
-  header .dot{width:8px;height:8px;border-radius:50%;background:var(--grn);margin-left:auto}
-  .main{display:flex;flex:1;min-height:0}
-  /* Left: file tree + editor */
-  .left{width:35%;display:flex;flex-direction:column;border-right:1px solid var(--bd);min-width:280px}
-  .tree{background:var(--bg2);padding:6px 8px;border-bottom:1px solid var(--bd);max-height:35%;overflow:auto;flex-shrink:0}
-  .tree .f{padding:3px 8px;font-size:12px;cursor:pointer;border-radius:4px;color:var(--tx2);font-family:ui-monospace,monospace}
-  .tree .f:hover{background:var(--bg3);color:var(--tx)}
-  .tree .f.active{background:var(--bg3);color:var(--acc)}
-  #editor{flex:1;min-height:0}
-  /* Center: chat */
-  .center{flex:1;display:flex;flex-direction:column;min-width:0}
-  .chat{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-  .msg{max-width:85%;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5}
-  .msg.user{align-self:flex-end;background:#1a1f2e;border:1px solid var(--bd)}
-  .msg.assistant{align-self:flex-start;background:var(--bg2);border:1px solid var(--bd)}
-  .msg.assistant pre{margin-top:6px;background:var(--bg);padding:8px 10px;border-radius:6px;font-size:12px;overflow-x:auto;white-space:pre-wrap}
-  .msg.system{align-self:center;background:transparent;color:var(--tx2);font-size:12px;font-style:italic}
-  .input-bar{padding:10px 16px;border-top:1px solid var(--bd);display:flex;gap:8px;align-items:flex-end}
-  .input-bar textarea{flex:1;background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:8px;padding:8px 12px;font-size:14px;resize:none;height:40px;max-height:120px;font-family:inherit}
-  .input-bar button{background:#6366f1;border:1px solid #7c3aed;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
-  .input-bar button:disabled{opacity:.4;cursor:wait}
-  /* Right: agent activity */
-  .right{width:30%;min-width:260px;display:flex;flex-direction:column;border-left:1px solid var(--bd);background:var(--bg2)}
-  .right .head{padding:8px 12px;border-bottom:1px solid var(--bd);font-size:12px;color:var(--tx2);display:flex;justify-content:space-between;align-items:center}
-  .right .head .spin{width:14px;height:14px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp 0.6s linear infinite}
-  @keyframes sp{to{transform:rotate(360deg)}}
-  .feed{flex:1;overflow:auto;padding:8px;display:flex;flex-direction:column;gap:4px}
-  .ev{font-size:11px;font-family:ui-monospace,monospace;padding:4px 8px;border-radius:4px;color:var(--tx2);line-height:1.4}
-  .ev .t{color:var(--tx2);font-size:10px;margin-right:6px}
-  .ev.round{color:var(--pur);font-weight:600}
-  .ev.generate{color:var(--acc)}
-  .ev.candidate{color:var(--tx);background:var(--bg3)}
-  .ev.conflicts{color:var(--yel)}
-  .ev.synth{color:var(--grn)}
-  .ev.frontier{color:var(--pur)}
-  .ev.security{color:var(--yel)}
-  .ev.verify{font-weight:600}
-  .ev.pass{color:var(--grn)}
-  .ev.fail{color:var(--red)}
-  .ev.halt{color:var(--grn);font-weight:bold;font-size:12px}
-  .ev.ws{color:var(--acc)}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{--bg:#fafafa;--surface:#fff;--surface2:#f4f4f5;--bd:#e4e4e7;--tx:#18181b;--tx2:#71717a;--tx3:#a1a1aa;--acc:#6366f1;--acc2:#818cf8;--grn:#22c55e;--red:#ef4444;--yel:#eab308;--pur:#a855f7;--radius:16px}
+@media(prefers-color-scheme:dark){:root{--bg:#09090b;--surface:#18181b;--surface2:#27272a;--bd:#3f3f46;--tx:#fafafa;--tx2:#a1a1aa;--tx3:#71717a}}
+html{font-size:16px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;flex-direction:column;line-height:1.5;-webkit-font-smoothing:antialiased}
+/* Top bar */
+header{padding:12px 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--bd);background:var(--surface);position:sticky;top:0;z-index:10;backdrop-filter:blur(8px)}
+header .logo{font-size:16px;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:6px}
+header .logo .dot{width:8px;height:8px;border-radius:50%;background:var(--grn);transition:background .3s}
+header .logo .dot.busy{background:var(--yel);animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.4}}
+header .files-btn{margin-left:auto;background:var(--surface2);border:1px solid var(--bd);color:var(--tx2);padding:6px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer}
+header .files-btn:active{transform:scale(.95)}
+/* Chat area */
+main{flex:1;display:flex;flex-direction:column;justify-content:flex-end;max-width:680px;margin:0 auto;width:100%;padding:16px;gap:12px;overflow-y:auto}
+/* Messages */
+.msg{max-width:88%;padding:12px 16px;border-radius:20px;font-size:15px;line-height:1.55;animation:slideIn .3s ease}
+@keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.msg.user{align-self:flex-end;background:var(--acc);color:#fff;border-bottom-right-radius:6px}
+.msg.agent{align-self:flex-start;background:var(--surface);border:1px solid var(--bd);border-bottom-left-radius:6px}
+.msg.agent pre{margin-top:8px;background:var(--surface2);border-radius:10px;padding:10px 12px;font-size:13px;overflow-x:auto;white-space:pre-wrap;font-family:'SF Mono',ui-monospace,monospace}
+.msg.system{align-self:center;background:transparent;color:var(--tx3);font-size:12px}
+/* Activity cards */
+.act-card{width:100%;background:var(--surface);border:1px solid var(--bd);border-radius:var(--radius);padding:12px 14px;animation:slideIn .3s ease}
+.act-card .title{font-size:12px;font-weight:600;color:var(--tx2);display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.act-card .title .icon{width:16px;height:16px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;font-size:10px}
+.act-card .body{font-size:13px;color:var(--tx);font-family:'SF Mono',ui-monospace,monospace;white-space:pre-wrap;word-break:break-word;line-height:1.5}
+.act-card .phase{font-size:11px;color:var(--tx3);font-family:ui-monospace,monospace;line-height:1.6}
+.act-card .phase .ok{color:var(--grn)} .act-card .phase .warn{color:var(--yel)} .act-card .phase .err{color:var(--red)}
+/* Empty state */
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:40px 20px;color:var(--tx3)}
+.empty .big{font-size:28px} .empty .txt{font-size:15px;max-width:280px;line-height:1.6}
+/* Input bar */
+.input-wrap{padding:8px 12px 12px;background:var(--surface);border-top:1px solid var(--bd);position:sticky;bottom:0;backdrop-filter:blur(8px)}
+.input-bar{max-width:680px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
+.input-bar textarea{flex:1;background:var(--surface2);border:1px solid var(--bd);color:var(--tx);border-radius:24px;padding:12px 16px;font-size:15px;font-family:inherit;resize:none;height:48px;max-height:120px;line-height:1.4;outline:none;transition:border-color .2s}
+.input-bar textarea:focus{border-color:var(--acc)}
+.input-bar button{background:var(--acc);color:#fff;border:none;width:44px;height:44px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:transform .1s,opacity .2s}
+.input-bar button:active{transform:scale(.9)}
+.input-bar button:disabled{opacity:.3}
+/* File drawer */
+.drawer{position:fixed;top:0;right:0;width:80vw;max-width:340px;height:100vh;background:var(--surface);border-left:1px solid var(--bd);transform:translateX(100%);transition:transform .3s;z-index:100;display:flex;flex-direction:column}
+.drawer.open{transform:none}
+.drawer .head{padding:12px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
+.drawer .head h3{font-size:14px;font-weight:600}
+.drawer .close{background:none;border:none;color:var(--tx2);font-size:20px;cursor:pointer}
+.drawer .list{flex:1;overflow:auto;padding:8px}
+.drawer .f{padding:10px 12px;font-size:13px;border-radius:10px;cursor:pointer;font-family:ui-monospace,monospace;color:var(--tx2);margin-bottom:2px}
+.drawer .f:active{background:var(--surface2)} .drawer .f.active{background:var(--surface2);color:var(--acc)}
+.drawer .editor-preview{border-top:1px solid var(--bd);flex:0 0 40%;display:flex;flex-direction:column}
+.drawer .editor-preview .ep-head{padding:8px 12px;font-size:11px;color:var(--tx3);border-bottom:1px solid var(--bd)}
+#mini-editor{flex:1;min-height:0}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.3);opacity:0;pointer-events:none;transition:opacity .3s;z-index:99}
+.overlay.show{opacity:1;pointer-events:auto}
+/* Spinner */
+.spin{width:14px;height:14px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp .6s linear infinite;display:inline-block}
+@keyframes sp{to{transform:rotate(360deg)}}
 </style></head><body>
 <header>
-  <h1>&#129504; pi-modal-mcp agent</h1>
-  <span class=sub>self-hosted OSS swarm on Modal GPUs</span>
-  <span class=dot id=dot></span>
+  <div class=logo><span class=dot id=dot></span> pi-modal-mcp</div>
+  <button class=files-btn onclick="document.getElementById('drawer').classList.add('open');document.getElementById('ov').classList.add('show')">Files</button>
 </header>
-<div class=main>
-  <div class=left>
-    <div class=tree id=tree></div>
-    <div id=editor></div>
+<main id=main>
+  <div class=empty id=empty>
+    <div class=big>&#129504;</div>
+    <div class=txt>Describe a coding task and the swarm will generate, test, and verify it on Modal GPUs.</div>
   </div>
-  <div class=center>
-    <div class=chat id=chat></div>
-    <div class=input-bar>
-      <textarea id=msg placeholder="Describe a coding task..." rows=1></textarea>
-      <button id=send>Send</button>
-    </div>
+</main>
+<div class=input-wrap>
+  <div class=input-bar>
+    <textarea id=msg placeholder="Ask the swarm..." rows=1></textarea>
+    <button id=send>&#8593;</button>
   </div>
-  <div class=right>
-    <div class=head><span>agent activity</span><span class=spin id=spin style=display:none></span></div>
-    <div class=feed id=feed></div>
+</div>
+<!-- File drawer -->
+<div class=overlay id=ov onclick="closeDrawer()"></div>
+<div class=drawer id=drawer>
+  <div class=head><h3>Workspace</h3><button class=close onclick=closeDrawer()>&times;</button></div>
+  <div class=list id=filelist></div>
+  <div class=editor-preview>
+    <div class=ep-head id=ep-name>No file selected</div>
+    <div id=mini-editor></div>
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
@@ -1682,98 +1698,102 @@ IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
 let ed,activeFile='';
 require.config({paths:{vs:'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs'}});
 require(['vs/editor/editor.main'],function(){
-  ed=monaco.editor.create(document.getElementById('editor'),{value:'// workspace files load on the left',language:'python',theme:'vs-dark',automaticLayout:true,fontSize:13,readOnly:true});
+  ed=monaco.editor.create(document.getElementById('mini-editor'),{value:'',language:'python',theme:'vs-dark',automaticLayout:true,fontSize:12,minimap:{enabled:false},scrollBeyondLastLine:false});
 });
 const $=id=>document.getElementById(id);
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function now(){return new Date().toLocaleTimeString('en',{hour12:false}).slice(0,8);}
+function closeDrawer(){$('drawer').classList.remove('open');$('ov').classList.remove('show');}
+// Auto-resize textarea
+$('msg').addEventListener('input',function(){this.style.height='40px';this.style.height=Math.min(this.scrollHeight,120)+'px';});
 // File tree
 async function loadTree(){
   try{const r=await fetch('/api/workspace');const d=await r.json();
-    $('tree').innerHTML=d.files.map(f=>'<div class=f data-p='+esc(f.path)+'>'+esc(f.path)+'</div>').join('');
-    document.querySelectorAll('.tree .f').forEach(el=>el.onclick=()=>openFile(el.dataset.p));
+    $('filelist').innerHTML=d.files.map(f=>'<div class=f data-p='+esc(f.path)+' onclick="openFile(\''+f.path+'\')">'+esc(f.path)+'</div>').join('');
   }catch(e){}
 }
 async function openFile(path){
   activeFile=path;
-  document.querySelectorAll('.tree .f').forEach(el=>el.classList.toggle('active',el.dataset.p===path));
+  document.querySelectorAll('.drawer .f').forEach(el=>el.classList.toggle('active',el.dataset.p===path));
+  $('ep-name').textContent=path;
   try{const r=await fetch('/api/workspace/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();
-    if(d.content!==undefined){ed.setValue(d.content);ed.updateOptions({readOnly:false});}
+    if(d.content!==undefined)ed.setValue(d.content);
   }catch(e){}
 }
-// Chat
-function addMsg(role,text){
-  const div=document.createElement('div');div.className='msg '+role;
-  // Render code blocks
-  const parts=text.split(/```/);
-  let html='';
-  for(let i=0;i<parts.length;i++){html+=i%2===1?'<pre>'+esc(parts[i])+'</pre>':esc(parts[i]);}
+// Messages
+function addMsg(cls,text){
+  $('empty')?.remove();
+  const div=document.createElement('div');div.className='msg '+cls;
+  const parts=text.split(/```/);let html='';
+  for(let i=0;i<parts.length;i++)html+=i%2===1?'<pre>'+esc(parts[i].replace(/^python\n/,''))+'</pre>':esc(parts[i]);
   div.innerHTML=html||esc(text);
-  $('chat').appendChild(div);$('chat').scrollTop=$('chat').scrollHeight;
+  $('main').appendChild(div);$('main').scrollTop=$('main').scrollHeight;
 }
-// Activity feed
-function addEvent(cls,text){
-  const div=document.createElement('div');div.className='ev '+cls;
-  div.innerHTML='<span class=t>'+now()+'</span>'+esc(text);
-  $('feed').appendChild(div);$('feed').scrollTop=$('feed').scrollHeight;
+// Activity card
+let curCard=null;
+function newCard(title){
+  $('empty')?.remove();
+  curCard=document.createElement('div');curCard.className='act-card';
+  curCard.innerHTML='<div class=title><span class=spin></span>'+esc(title)+'</div><div class=phase></div>';
+  $('main').appendChild(curCard);$('main').scrollTop=$('main').scrollHeight;
+  return curCard.querySelector('.phase');
 }
-// Agent: send task, stream cognition events, apply results
+function addPhase(cls,text){
+  if(!curCard)return;
+  const p=document.createElement('div');p.className=cls;p.innerHTML=text;
+  curCard.querySelector('.phase').appendChild(p);
+  $('main').scrollTop=$('main').scrollHeight;
+}
+function finishCard(){
+  if(curCard){curCard.querySelector('.title .spin')?.remove();}
+  curCard=null;
+}
+// Agent
 let busy=false;
 $('send').onclick=sendTask;
 $('msg').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendTask();}};
 async function sendTask(){
   const task=$('msg').value.trim();if(!task||busy)return;
-  busy=true;$('send').disabled=true;$('spin').style.display='inline-block';$('dot').style.background='var(--yel)';
-  $('msg').value='';
+  busy=true;$('send').disabled=true;$('dot').classList.add('busy');
+  $('msg').value='';$('msg').style.height='48px';
   addMsg('user',task);
-  addMsg('system','agent starting cognition loop...');
-  addEvent('round','\u2192 task: '+task.slice(0,60));
+  const phases=newCard('Cognition loop');
+  addPhase('','\u2192 task: '+task.slice(0,60));
   const body={goal:task,n:2,max_rounds:3,max_new_tokens:128,workspace_path:activeFile||undefined};
   try{
     const r=await fetch('/api/cognition',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const reader=r.body.getReader();const dec=new TextDecoder();let buf='';let haltReason='';let synthCode='';
+    const reader=r.body.getReader();const dec=new TextDecoder();let buf='';let halt='',synth='';
     while(true){
       const{done,value}=await reader.read();if(done)break;
-      buf+=dec.decode(value,{stream:true});
-      const lines=buf.split('\n');buf=lines.pop();
+      buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop();
       for(const line of lines){
         if(!line.startsWith('data: '))continue;
         const d=line.slice(6).trim();if(d==='[DONE]')continue;
         try{
           const e=JSON.parse(d);const ev=e.event||'';const r=e.round||'';
-          if(ev==='round_start')addEvent('round','R'+r+'/'+e.max_rounds+' starting');
-          else if(ev==='generate')addEvent('generate','generating: '+e.role+' (worker '+e.worker+')');
-          else if(ev==='candidate')addEvent('candidate','candidate '+e.worker+': '+(e.content||'').slice(0,50));
-          else if(ev==='conflicts')addEvent('conflicts',e.count+' conflict(s) detected');
-          else if(ev==='tests')addEvent('synth','tests: '+(e.content||'').slice(0,50));
-          else if(ev==='synthesize'){addEvent('synth','synthesis: '+(e.content||'').slice(0,60));synthCode=e.content||'';}
-          else if(ev==='frontier_verify_start')addEvent('frontier','frontier verifying ('+e.model+')...');
-          else if(ev==='frontier_corrected')addEvent('frontier','\u26a0 frontier CORRECTED (delta)');
-          else if(ev==='frontier_accepted')addEvent('frontier','\u2713 frontier accepted');
-          else if(ev==='security_review_start')addEvent('security','security review...');
-          else if(ev==='security_corrected')addEvent('security','\u26a0 security fix applied');
-          else if(ev==='security_passed')addEvent('security','\u2713 security passed');
-          else if(ev==='verify_result')addEvent(e.passed?'pass':'fail',(e.passed?'\u2713 PASS':'\u2717 FAIL')+(e.stdout?' out='+e.stdout.slice(0,20):''));
-          else if(ev==='workspace_applied')addEvent('ws','\u2713 applied to '+e.path);
-          else if(ev==='halt'){haltReason=e.reason;addEvent('halt','\u25a0 HALT: '+e.reason+' ('+e.elapsed+'s, R'+e.round+')');}
+          if(ev==='round_start')addPhase('','R'+r+'/'+e.max_rounds');
+          else if(ev==='generate')addPhase('','\u27a4 '+e.role+' generating...');
+          else if(ev==='candidate')addPhase('','\u00b7 candidate '+(e.content||'').slice(0,40).replace(/\n/g,' '));
+          else if(ev==='conflicts')addPhase(e.count?'warn':'ok',e.count+' conflicts');
+          else if(ev==='synthesize'){addPhase('ok','\u2713 synthesis');synth=e.content||'';}
+          else if(ev==='tests')addPhase('','\u27a4 tests generated');
+          else if(ev==='frontier_verify_start')addPhase('','\u27a4 frontier ('+e.model+')...');
+          else if(ev==='frontier_accepted')addPhase('ok','\u2713 frontier accepted');
+          else if(ev==='frontier_corrected')addPhase('warn','\u26a0 frontier corrected');
+          else if(ev==='security_passed')addPhase('ok','\u2713 security passed');
+          else if(ev==='security_corrected')addPhase('warn','\u26a0 security fixed');
+          else if(ev==='verify_result')addPhase(e.passed?'ok':'err',e.passed?'\u2713 PASS: '+(e.stdout||'').trim().slice(0,30):'\u2717 FAIL');
+          else if(ev==='workspace_applied')addPhase('ok','\u2713 applied to '+e.path);
+          else if(ev==='halt'){halt=e.reason;addPhase('ok','\u25a0 '+e.reason+' ('+e.elapsed+'s)');}
         }catch(err){}
       }
     }
-    // Show result in chat
-    if(haltReason==='verified'&&synthCode){
-      addMsg('assistant','Done! Verified in sandbox. Applied to '+activeFile+'.\n```python\n'+synthCode+'\n```');
-    }else if(haltReason==='max_rounds'){
-      addMsg('assistant','Reached max rounds without verification. The code may need manual review.\n```python\n'+synthCode+'\n```');
-    }else{
-      addMsg('assistant','Cognition loop completed ('+haltReason+').');
-    }
-    loadTree(); // refresh file tree
-    if(activeFile)openFile(activeFile); // reload editor with changes
-  }catch(e){
-    addMsg('assistant','Error: '+e);
-  }finally{
-    busy=false;$('send').disabled=false;$('spin').style.display='none';$('dot').style.background='var(--grn)';
-  }
+    finishCard();
+    if(halt==='verified'&&synth){addMsg('agent','Done! Verified and applied.\n```python\n'+synth+'\n```');}
+    else if(halt){addMsg('agent','Finished ('+halt+'). Needs review.\n```python\n'+synth+'\n```');}
+    else{addMsg('agent','Cognition completed.');}
+    loadTree();
+  }catch(e){finishCard();addMsg('agent','Error: '+e);}
+  finally{busy=false;$('send').disabled=false;$('dot').classList.remove('busy');}
 }
 loadTree();
 </script>
