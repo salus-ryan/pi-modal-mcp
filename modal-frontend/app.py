@@ -1430,6 +1430,7 @@ IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
     <label>n <input id=n type=number value=3 min=1 max=16></label>
     <label>tokens <input id=tok type=number value=128 min=8 max=1024></label>
     <button id=run>Run swarm</button>
+    <button id=cog style='background:#7c3aed;border-color:#6d28d9'>Run cognition</button>
   </div>
 </header>
 <main>
@@ -1461,6 +1462,54 @@ $('run').onclick=async function(){
     const d=await r.json();
     $('status').textContent='done in '+d.elapsed+'s ('+d.concurrent+' workers)';
     $('results').innerHTML=d.results.map((x,i)=>'<div class=card><div class=ctitle><span>#'+(i+1)+' '+esc(x.model)+'</span><span>'+(x.elapsed?x.elapsed+'s':'')+'</span></div><div class=cbody'+(x.error?' style=color:#f85149':'')+'>'+esc(x.error||x.completion)+'</div></div>').join('');
+  }catch(e){$('status').textContent='error';$('results').innerHTML='<div class=card><div class=cbody style=color:#f85149>'+esc(String(e))+'</div></div>';}
+  finally{btn.disabled=false;}
+};
+$('cog').onclick=async function(){
+  if(!ed)return;
+  const btn=this;btn.disabled=true;$('status').textContent='cognition running...';
+  const body={goal:ed.getValue(),n:parseInt($('n').value,10),max_rounds:3,max_new_tokens:parseInt($('tok').value,10)};
+  $('results').innerHTML='<div class=card><div class=cbody style=color:#8b949e>Starting 7-phase cognition loop (generate / conflict / test / critique / frontier / security / verify)...</div></div>';
+  const cards=[];
+  try{
+    const r=await fetch('/api/cognition',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const reader=r.body.getReader();
+    const dec=new TextDecoder();
+    let buf='';
+    while(true){
+      const{done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split('\n');
+      buf=lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data: '))continue;
+        const d=line.slice(6).trim();
+        if(d==='[DONE]')continue;
+        try{
+          const e=JSON.parse(d);
+          const ev=e.event||'';const r=e.round||'';
+          let html='';
+          if(ev==='round_start')html='<div class=card><div class=ctitle><span>Round '+r+'</span><span>start</span></div><div class=cbody>Starting round '+r+' of '+e.max_rounds+'</div></div>';
+          else if(ev==='generate')html='<div class=card><div class=cbody style=color:#79c0ff>[R'+r+'] generating: worker '+e.worker+' role='+e.role+'</div></div>';
+          else if(ev==='candidate')html='<div class=card><div class=ctitle><span>R'+r+' candidate '+e.worker+'</span></span></div><div class=cbody>'+esc(e.content||'')+'</div></div>';
+          else if(ev==='conflicts')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] conflicts detected: '+e.count+'</div></div>';
+          else if(ev==='tests')html='<div class=card><div class=ctitle><span>R'+r+' tests</span></div><div class=cbody>'+esc(e.content||'')+'</div></div>';
+          else if(ev==='synthesize')html='<div class=card><div class=ctitle><span>R'+r+' synthesis</span></div><div class=cbody style=color:#16a34a>'+esc(e.content||'')+'</div></div>';
+          else if(ev==='frontier_verify_start')html='<div class=card><div class=cbody style=color:#a78bfa>[R'+r+'] frontier verifying ('+e.model+')...</div></div>';
+          else if(ev==='frontier_corrected')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] frontier CORRECTED</div></div>';
+          else if(ev==='frontier_accepted')html='<div class=card><div class=cbody style=color:#16a34a>[R'+r+'] frontier accepted</div></div>';
+          else if(ev==='security_review_start')html='<div class=card><div class=cbody style=color:#a78bfa>[R'+r+'] security review...</div></div>';
+          else if(ev==='security_corrected')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] security CORRECTED</div></div>';
+          else if(ev==='security_passed')html='<div class=card><div class=cbody style=color:#16a34a>[R'+r+'] security passed</div></div>';
+          else if(ev==='verify_result')html='<div class=card><div class=cbody style=color:'+(e.passed?'#16a34a':'#f85149')+';font-weight:bold>[R'+r+'] '+(e.passed?'PASS':'FAIL')+' out='+(e.stdout||'').slice(0,30)+'</div></div>';
+          else if(ev==='workspace_applied')html='<div class=card><div class=cbody style=color:#0ea5e9>[R'+r+'] applied to workspace: '+e.path+'</div></div>';
+          else if(ev==='halt'){$('status').textContent='halt: '+e.reason+' ('+e.elapsed+'s)';html='<div class=card><div class=ctitle><span>HALT</span><span>'+e.reason+'</span></div><div class=cbody style=color:#16a34a;font-weight:bold>'+e.reason+' after '+e.elapsed+'s, round '+e.round+'</div></div>';}
+          if(html){cards.push(html);$('results').innerHTML=cards.join('');
+            const panel=document.getElementById('results');panel.scrollTop=panel.scrollHeight;}
+        }catch(err){}
+      }
+    }
   }catch(e){$('status').textContent='error';$('results').innerHTML='<div class=card><div class=cbody style=color:#f85149>'+esc(String(e))+'</div></div>';}
   finally{btn.disabled=false;}
 };
