@@ -619,6 +619,26 @@ def web():
     async def workspace_revert(req: dict):
         return await workspace.remote.aio("revert", path=req.get("path",""))
 
+    @api.post("/api/workspace/git/init")
+    async def workspace_git_init():
+        return await workspace.remote.aio("git_init")
+
+    @api.post("/api/workspace/git/commit")
+    async def workspace_git_commit(req: dict):
+        return await workspace.remote.aio("git_commit", record=req)
+
+    @api.get("/api/workspace/git/diff")
+    async def workspace_git_diff():
+        return await workspace.remote.aio("git_diff")
+
+    @api.get("/api/workspace/git/log")
+    async def workspace_git_log():
+        return await workspace.remote.aio("git_log")
+
+    @api.get("/api/workspace/git/status")
+    async def workspace_git_status():
+        return await workspace.remote.aio("git_status")
+
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
@@ -902,6 +922,11 @@ def build_mcp():
         - 'diff': diff two files (file1 vs file2)
         - 'snapshot': save a .prev version of a file (for revert)
         - 'revert': revert a file to its .prev snapshot
+        - 'git_init': initialize a git repo in the workspace
+        - 'git_commit': stage all changes and commit (record.message for message)
+        - 'git_diff': show uncommitted changes vs HEAD
+        - 'git_log': show recent commit log
+        - 'git_status': show working tree status
 
         This lets the cognition loop operate on real files (tree, diff, apply/revert)
         instead of just isolated code snippets.
@@ -1233,8 +1258,8 @@ def delta_store(action: str = "read", record: dict = None, limit: int = 50) -> d
     return {"error": f"unknown action: {action}"}
 
 
-@app.function(image=base_image, volumes={"/workspace": WORKSPACE_VOL}, timeout=60)
-def workspace(action: str, path: str = "", content: str = "", file1: str = "", file2: str = "") -> dict:
+@app.function(image=modal.Image.debian_slim(python_version="3.11").apt_install("git"), volumes={"/workspace": WORKSPACE_VOL}, timeout=60)
+def workspace(action: str, path: str = "", content: str = "", file1: str = "", file2: str = "", record: dict = None) -> dict:
     """Repository workspace: file tree operations on a Modal volume.
 
     The cognition loop can operate on real files (tree, read, write, diff,
@@ -1307,6 +1332,37 @@ def workspace(action: str, path: str = "", content: str = "", file1: str = "", f
         shutil.copy2(prev, full)
         WORKSPACE_VOL.commit()
         return {"reverted": path}
+
+    elif action == "git_init":
+        import subprocess
+        subprocess.run(["git", "init"], cwd=base, capture_output=True, timeout=10)
+        subprocess.run(["git", "config", "user.email", "swarm@modal.run"], cwd=base, capture_output=True, timeout=5)
+        subprocess.run(["git", "config", "user.name", "pi-modal-mcp swarm"], cwd=base, capture_output=True, timeout=5)
+        WORKSPACE_VOL.commit()
+        return {"git_init": True}
+
+    elif action == "git_commit":
+        import subprocess
+        subprocess.run(["git", "add", "-A"], cwd=base, capture_output=True, timeout=10)
+        msg = record.get("message", "swarm cognition update") if record else "swarm cognition update"
+        r = subprocess.run(["git", "commit", "-m", msg], cwd=base, capture_output=True, text=True, timeout=10)
+        WORKSPACE_VOL.commit()
+        return {"committed": r.returncode == 0, "output": r.stdout[:500] + r.stderr[:500]}
+
+    elif action == "git_diff":
+        import subprocess
+        r = subprocess.run(["git", "diff", "HEAD"], cwd=base, capture_output=True, text=True, timeout=10)
+        return {"diff": r.stdout[:2000], "lines": len(r.stdout.splitlines())}
+
+    elif action == "git_log":
+        import subprocess
+        r = subprocess.run(["git", "log", "--oneline", "-10"], cwd=base, capture_output=True, text=True, timeout=10)
+        return {"log": r.stdout.strip()}
+
+    elif action == "git_status":
+        import subprocess
+        r = subprocess.run(["git", "status", "--short"], cwd=base, capture_output=True, text=True, timeout=10)
+        return {"status": r.stdout.strip(), "clean": len(r.stdout.strip()) == 0}
 
     return {"error": f"unknown action: {action}"}
 
