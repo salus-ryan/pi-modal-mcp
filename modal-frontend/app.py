@@ -23,6 +23,7 @@ llm_image = (
 )
 
 MODEL_VOL = modal.Volume.from_name("pi-frontend-models", create_if_missing=True)
+COALITION_VOL = modal.Volume.from_name("pi-frontend-coalitions", create_if_missing=True)
 DEFAULT_MODEL = "Qwen/CodeQwen1.5-7B-Chat"
 
 
@@ -310,6 +311,18 @@ def web():
         max_new = int(req.get("max_new_tokens", 256))
         ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
 
+        # Adaptive coalition selection: if model_pool provided, select best coalition
+        model_pool = req.get("model_pool", "")
+        adaptive = bool(req.get("adaptive", False))
+        coalition_selected = None
+        if adaptive and model_pool:
+            selection = await coalition_store.remote.aio("select", pool=model_pool, n=n)
+            ids = [m.strip() for m in selection["coalition"].split(",") if m.strip()]
+            coalition_selected = selection
+            yield_init = f"data: {json.dumps({'event':'coalition_selected','coalition':selection['coalition'],'explored':selection['explored'],'total_possible':selection['total_possible']})}\n\n"
+        else:
+            yield_init = None
+
         # Frontier model config (speculative verification)
         frontier_base = req.get("frontier_base_url") or req.get("frontier_api_base", "")
         frontier_key = req.get("frontier_api_key", "")
@@ -347,6 +360,8 @@ def web():
         t0 = time.time()
 
         async def generate():
+            if coalition_selected:
+                yield f"data: {json.dumps({'event':'coalition_selected','coalition':coalition_selected['coalition'],'explored':coalition_selected['explored'],'total_possible':coalition_selected['total_possible']})}\n\n"
             for round_num in range(1, max_rounds + 1):
                 blackboard["round"] = round_num
                 yield f"data: {json.dumps({'event':'round_start','round':round_num,'max_rounds':max_rounds,'elapsed':round(time.time()-t0,1)})}\n\n"
@@ -420,6 +435,9 @@ def web():
 
                 if result["passed"]:
                     blackboard["halted"] = True; blackboard["halt_reason"] = "verified"
+                    if coalition_selected:
+                        await coalition_store.remote.aio("record", coalition=coalition_selected["coalition"],
+                            result={"delta_changed": (blackboard.get("delta") or {}).get("changed",False),"rounds":round_num,"elapsed":round(time.time()-t0,1)})
                     yield f"data: {json.dumps({'event':'halt','reason':'verified','round':round_num,'elapsed':round(time.time()-t0,1),'blackboard':blackboard})}\n\n"
                     yield "data: [DONE]\n\n"; return
                 else:
@@ -428,6 +446,9 @@ def web():
                     yield f"data: {json.dumps({'event':'round_end','round':round_num,'passed':False,'elapsed':round(time.time()-t0,1)})}\n\n"
 
             blackboard["halted"] = True; blackboard["halt_reason"] = "max_rounds"
+            if coalition_selected:
+                await coalition_store.remote.aio("record", coalition=coalition_selected["coalition"],
+                    result={"delta_changed": (blackboard.get("delta") or {}).get("changed",False),"rounds":max_rounds,"elapsed":round(time.time()-t0,1)})
             yield f"data: {json.dumps({'event':'halt','reason':'max_rounds','round':max_rounds,'elapsed':round(time.time()-t0,1),'blackboard':blackboard})}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -439,6 +460,17 @@ def web():
         timeout = int(req.get("timeout", 10))
         result = await execute_code.remote.aio(code, timeout)
         return result
+
+    # --- Coalition stats + adaptive selection ---
+    @api.get("/api/coalition")
+    async def coalition_get():
+        return await coalition_store.remote.aio("read")
+
+    @api.post("/api/coalition/select")
+    async def coalition_select(req: dict):
+        pool = req.get("pool", DEFAULT_MODEL)
+        n = int(req.get("n", 3))
+        return await coalition_store.remote.aio("select", pool=pool, n=n)
 
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
@@ -674,6 +706,21 @@ def build_mcp():
         return json.dumps(bb)
 
     @mcp_server.tool()
+    async def modal_coalition(action: str = "read", pool: str = "", n: int = 3) -> str:
+        """Read coalition performance stats or select the best coalition adaptively.
+
+        Actions:
+        - 'read': return all coalition stats (acceptance rates, rounds, elapsed)
+        - 'select': given a model pool (comma-separated), use epsilon-greedy to select
+          the best-known coalition or explore a new one. Returns {coalition, models, explored, total_possible, stats}.
+
+        The system tracks how often the frontier accepts vs corrects each coalition.
+        Over time, it converges on the coalition that best approximates the frontier.
+        """
+        result = await coalition_store.remote.aio(action, pool=pool, n=n)
+        return json.dumps(result)
+
+    @mcp_server.tool()
     async def modal_test(goal: str, models: str = DEFAULT_MODEL, max_new_tokens: int = 256) -> str:
         """Generate assert-based test cases for a coding goal.
 
@@ -849,6 +896,77 @@ async def frontier_verify(api_base: str, api_key: str, model: str, system_prompt
     with urllib.request.urlopen(req, timeout=60) as r:
         result = json.loads(r.read())
     return {"model": model, "content": result["choices"][0]["message"]["content"]}
+
+
+@app.function(image=base_image, volumes={"/coalitions": COALITION_VOL}, timeout=60)
+def coalition_store(action: str, coalition: str = "", result: dict = None, pool: str = "", n: int = 3):
+    """Read/record/select coalition performance stats (adaptive coalition selection).
+
+    Persistent store on a Modal Volume. Tracks per-coalition frontier acceptance
+    rates, rounds, and elapsed time. Uses epsilon-greedy for exploration vs exploitation.
+    """
+    import json, os, random
+    from itertools import combinations
+
+    stats_path = "/coalitions/stats.json"
+    os.makedirs("/coalitions", exist_ok=True)
+
+    def load():
+        if os.path.exists(stats_path):
+            with open(stats_path) as f:
+                return json.load(f)
+        return {}
+
+    def save(stats):
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        COALITION_VOL.commit()
+
+    if action == "read":
+        return load()
+
+    elif action == "record":
+        stats = load()
+        if coalition not in stats:
+            stats[coalition] = {"runs": 0, "accepted": 0, "corrected": 0,
+                                "total_rounds": 0, "total_elapsed": 0}
+        s = stats[coalition]
+        s["runs"] += 1
+        changed = result.get("delta_changed", False) if result else False
+        if changed:
+            s["corrected"] += 1
+        else:
+            s["accepted"] += 1
+        s["acceptance_rate"] = round(s["accepted"] / s["runs"], 3)
+        s["total_rounds"] += result.get("rounds", 1) if result else 1
+        s["total_elapsed"] += result.get("elapsed", 0) if result else 0
+        s["avg_rounds"] = round(s["total_rounds"] / s["runs"], 2)
+        s["avg_elapsed"] = round(s["total_elapsed"] / s["runs"], 1)
+        s["last_delta_changed"] = changed
+        save(stats)
+        return s
+
+    elif action == "select":
+        stats = load()
+        models_pool = [m.strip() for m in pool.split(",") if m.strip()] or [DEFAULT_MODEL]
+        size = min(n, len(models_pool))
+        possible = list(combinations(models_pool, size)) or [tuple(models_pool)]
+        possible_strs = [",".join(c) for c in possible]
+
+        epsilon = 0.3  # 30% exploration
+        if random.random() < epsilon or not any(k in stats for k in possible_strs):
+            chosen = list(random.choice(possible))
+        else:
+            known = [(c, stats.get(",".join(c), {}).get("acceptance_rate", 0)) for c in possible if ",".join(c) in stats]
+            known.sort(key=lambda x: x[1], reverse=True)
+            chosen = list(known[0][0]) if known else list(random.choice(possible))
+
+        return {"coalition": ",".join(chosen), "models": chosen,
+                "explored": len([k for k in possible_strs if k in stats]),
+                "total_possible": len(possible),
+                "stats": {k: v for k, v in stats.items() if k in possible_strs}}
+
+    return {"error": f"unknown action: {action}"}
 
 
 @app.function(image=modal.Image.debian_slim(python_version="3.11"), timeout=60, cpu=1, memory=512)
