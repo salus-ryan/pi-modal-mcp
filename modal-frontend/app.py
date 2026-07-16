@@ -298,11 +298,11 @@ def web():
             "synthesis": synth,
         }
 
-    # --- Swarm cognition loop: multi-round generate → critique → verify → (retry or halt) ---
+    # --- Swarm cognition loop: multi-round generate → conflict-detect → test-gen → critique → verify ---
     @api.post("/api/cognition")
     async def cognition(req: dict):
         from fastapi.responses import StreamingResponse
-        import re
+        import re, difflib
         goal = req.get("goal", req.get("prompt", ""))
         models = req.get("models", DEFAULT_MODEL)
         n = max(1, min(int(req.get("n", 3)), 8))
@@ -313,15 +313,31 @@ def web():
         ROLE_PROMPTS = {
             "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code, no markdown.",
             "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
-            "critic": "You are a senior code reviewer. Review the candidates, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+            "critic": "You are a senior code reviewer. Review the candidates and conflicts below, resolve the conflicts, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+            "tester": "You are a test engineer. Given a task, write Python assert statements that verify the solution is correct. Output ONLY assert statements, no function definitions.",
         }
 
         def extract_code(text):
             match = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
             return match.group(1).strip() if match else text.strip()
 
+        def detect_conflicts(cands):
+            """Diff candidate code, identify where they disagree."""
+            conflicts = []
+            codes = [extract_code(c["completion"]) for c in cands if not isinstance(c, Exception) and "completion" in c]
+            if len(codes) < 2:
+                return conflicts
+            for i in range(len(codes)):
+                for j in range(i + 1, len(codes)):
+                    la, lb = codes[i].splitlines(), codes[j].splitlines()
+                    diffs = [d for d in difflib.unified_diff(la, lb, lineterm="", n=1)
+                             if d.startswith(("+ ", "- ")) and not d.startswith(("+++", "---"))]
+                    if diffs:
+                        conflicts.append({"pair": [i, j], "diffs": diffs[:10]})
+            return conflicts
+
         blackboard = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
-                      "conflicts": [], "constraints": [], "verifications": [],
+                      "conflicts": [], "constraints": [], "verifications": [], "tests": [],
                       "synthesis": None, "halted": False, "halt_reason": None}
         t0 = time.time()
 
@@ -335,6 +351,7 @@ def web():
                     ct = "\n".join(f"  - {c}" for c in blackboard["constraints"])
                     prompt = f"{goal}\n\n## Previous failures:\n{ct}\n\nFix and write the complete solution."
 
+                # Phase 1: Generate candidates (role specialization)
                 candidates = []
                 for i in range(n):
                     role = "planner" if (i == 0 and n > 1) else "coder"
@@ -345,16 +362,38 @@ def web():
                     blackboard["claims"].append({"id":f"r{round_num}c{i}","model":result["model"],"role":role,"content":result["completion"],"round":round_num})
                     yield f"data: {json.dumps({'event':'candidate','worker':i,'round':round_num,'content':result['completion'][:300]})}\n\n"
 
+                # Phase 2: Conflict detection (diff candidates)
+                conflicts = detect_conflicts(candidates)
+                blackboard["conflicts"] = conflicts
+                yield f"data: {json.dumps({'event':'conflicts','round':round_num,'count':len(conflicts),'conflicts':conflicts[:3]})}\n\n"
+
+                # Phase 3: Test generation (tester role) — in parallel with critique
+                yield f"data: {json.dumps({'event':'test_generate','round':round_num})}\n\n"
+                test_prompt = f"{ROLE_PROMPTS['tester']}\n\n## Task\n{goal}"
+                test_result = await llm_worker.remote.aio(ids[0], test_prompt, max_new)
+                test_code = extract_code(test_result["completion"])
+                blackboard["tests"].append({"round": round_num, "code": test_code})
+                yield f"data: {json.dumps({'event':'tests','round':round_num,'content':test_code[:300]})}\n\n"
+
+                # Phase 4: Critique + synthesize (critic gets candidates + conflicts)
                 cand_text = "\n\n---\n\n".join(f"### Candidate {i+1} ({c['model']}):\n{c['completion']}" for i,c in enumerate(candidates))
-                yield f"data: {json.dumps({'event':'critique_start','round':round_num})}\n\n"
-                synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:", max_new)
+                conflict_text = ""
+                if conflicts:
+                    conflict_text = "\n\n## Conflicts detected between candidates:\n"
+                    for cf in conflicts[:5]:
+                        conflict_text += f"- Candidates {cf['pair']} differ on: {', '.join(cf['diffs'][:3])}\n"
+                    conflict_text += "\nResolve these conflicts in your synthesis."
+                yield f"data: {json.dumps({'event':'critique_start','round':round_num,'conflicts':len(conflicts)})}\n\n"
+                synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}{conflict_text}\n\n## Final solution:", max_new)
                 code = extract_code(synth["completion"])
                 blackboard["synthesis"] = code
                 yield f"data: {json.dumps({'event':'synthesize','round':round_num,'content':code[:500]})}\n\n"
 
-                yield f"data: {json.dumps({'event':'verify_start','round':round_num,'code':code[:300]})}\n\n"
-                result = await execute_code.remote.aio(code, timeout=10)
-                blackboard["verifications"].append({"round":round_num,"code":code,"result":result})
+                # Phase 5: Verify — run code + tests in sandbox
+                full_code = code + "\n\n# --- tests ---\n" + test_code
+                yield f"data: {json.dumps({'event':'verify_start','round':round_num,'code':code[:200],'tests':test_code[:200]})}\n\n"
+                result = await execute_code.remote.aio(full_code, timeout=10)
+                blackboard["verifications"].append({"round":round_num,"code":code,"tests":test_code,"result":result})
                 yield f"data: {json.dumps({'event':'verify_result','round':round_num,'passed':result['passed'],'stdout':result['stdout'][:500],'stderr':result['stderr'][:500]})}\n\n"
 
                 if result["passed"]:
@@ -363,7 +402,7 @@ def web():
                     yield "data: [DONE]\n\n"; return
                 else:
                     err = result["stderr"][:500] if result["stderr"] else f"exit {result['exit_code']}"
-                    blackboard["constraints"].append(f"Round {round_num}: {err}")
+                    blackboard["constraints"].append(f"Round {round_num}: tests failed — {err}")
                     yield f"data: {json.dumps({'event':'round_end','round':round_num,'passed':False,'elapsed':round(time.time()-t0,1)})}\n\n"
 
             blackboard["halted"] = True; blackboard["halt_reason"] = "max_rounds"
@@ -512,29 +551,42 @@ def build_mcp():
 
     @mcp_server.tool()
     async def modal_cognition(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_rounds: int = 3, max_new_tokens: int = 256) -> str:
-        """Run the full swarm cognition loop: multi-round generate -> critique -> synthesize -> verify.
+        """Run the full swarm cognition loop with test generation and conflict detection.
 
         Each round:
-        1. N workers (coder/planner roles) generate candidate solutions in parallel.
-        2. A critic reviews all candidates and synthesizes ONE canonical answer.
-        3. The synthesized code is executed in a sandbox (verification).
-        4. If it passes -> halt with 'verified'. If it fails -> error fed back as constraint, next round revises.
+        1. N workers (planner/coder) generate candidates in parallel.
+        2. Conflicts detected via difflib (where candidates disagree).
+        3. Tester role generates assert-based test cases.
+        4. Critic reviews candidates + conflicts, synthesizes ONE canonical answer.
+        5. Code + tests executed in sandbox. If passes -> halt 'verified'.
+           If fails -> error fed back as constraint, next round revises.
 
-        Returns JSON: the final blackboard (SCL-inspired shared state) with all
-        rounds, claims, constraints, verifications, synthesis, and halt state.
+        Returns JSON: the SCL-inspired blackboard with goals, claims, conflicts,
+        constraints, tests, verifications, synthesis, and halt state.
         """
-        import re, time
+        import re, time, difflib
         ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
         ROLE_PROMPTS = {
             "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code.",
             "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
-            "critic": "You are a senior code reviewer. Review candidates, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+            "critic": "You are a senior code reviewer. Review candidates and conflicts, resolve conflicts, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+            "tester": "You are a test engineer. Given a task, write Python assert statements that verify correctness. Output ONLY assert statements.",
         }
         def extract_code(text):
             m = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
             return m.group(1).strip() if m else text.strip()
+        def detect_conflicts(cands):
+            conflicts = []
+            codes = [extract_code(c["completion"]) for c in cands if not isinstance(c, Exception) and "completion" in c]
+            if len(codes) < 2: return conflicts
+            for i in range(len(codes)):
+                for j in range(i+1, len(codes)):
+                    la, lb = codes[i].splitlines(), codes[j].splitlines()
+                    diffs = [d for d in difflib.unified_diff(la, lb, lineterm="", n=1) if d.startswith(("+ ", "- ")) and not d.startswith(("+++", "---"))]
+                    if diffs: conflicts.append({"pair": [i, j], "diffs": diffs[:10]})
+            return conflicts
         bb = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
-              "conflicts": [], "constraints": [], "verifications": [],
+              "conflicts": [], "constraints": [], "verifications": [], "tests": [],
               "synthesis": None, "halted": False, "halt_reason": None}
         t0 = time.time()
         for rnd in range(1, max_rounds + 1):
@@ -550,22 +602,56 @@ def build_mcp():
                 result = await llm_worker.remote.aio(ids[i % len(ids)], f"{rp}\n\n## Task\n{prompt}", max_new_tokens)
                 candidates.append(result)
                 bb["claims"].append({"id": f"r{rnd}c{i}", "model": result["model"], "role": role, "content": result["completion"], "round": rnd})
+            # Conflict detection
+            conflicts = detect_conflicts(candidates)
+            bb["conflicts"] = conflicts
+            # Test generation
+            test_result = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['tester']}\n\n## Task\n{goal}", max_new_tokens)
+            test_code = extract_code(test_result["completion"])
+            bb["tests"].append({"round": rnd, "code": test_code})
+            # Critique + synthesize
             cand_text = "\n\n---\n\n".join(f"### Candidate {i+1} ({c['model']}):\n{c['completion']}" for i,c in enumerate(candidates))
-            synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:", max_new_tokens)
+            conflict_text = ""
+            if conflicts:
+                conflict_text = "\n\n## Conflicts:\n"
+                for cf in conflicts[:5]:
+                    conflict_text += f"- Candidates {cf['pair']} differ: {', '.join(cf['diffs'][:3])}\n"
+                conflict_text += "\nResolve these conflicts."
+            synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}{conflict_text}\n\n## Final solution:", max_new_tokens)
             code = extract_code(synth["completion"])
             bb["synthesis"] = code
-            result = await execute_code.remote.aio(code, timeout=10)
-            bb["verifications"].append({"round": rnd, "code": code, "result": result})
+            # Verify: run code + tests
+            full_code = code + "\n\n# --- tests ---\n" + test_code
+            result = await execute_code.remote.aio(full_code, timeout=10)
+            bb["verifications"].append({"round": rnd, "code": code, "tests": test_code, "result": result})
             if result["passed"]:
                 bb["halted"] = True; bb["halt_reason"] = "verified"
                 break
             else:
                 err = result["stderr"][:500] if result["stderr"] else f"exit {result['exit_code']}"
-                bb["constraints"].append(f"Round {rnd}: {err}")
+                bb["constraints"].append(f"Round {rnd}: tests failed — {err}")
         else:
             bb["halted"] = True; bb["halt_reason"] = "max_rounds"
         bb["elapsed"] = round(time.time() - t0, 1)
         return json.dumps(bb)
+
+    @mcp_server.tool()
+    async def modal_test(goal: str, models: str = DEFAULT_MODEL, max_new_tokens: int = 256) -> str:
+        """Generate assert-based test cases for a coding goal.
+
+        A tester role writes Python assert statements that verify a solution
+        to the goal is correct. Returns JSON: {tests, model, elapsed}.
+        """
+        import re, time
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        tester_prompt = ("You are a test engineer. Given a task, write Python assert "
+                         "statements that verify the solution is correct. Output ONLY assert statements.")
+        t0 = time.time()
+        result = await llm_worker.remote.aio(ids[0], f"{tester_prompt}\n\n## Task\n{goal}", max_new_tokens)
+        def extract_code(text):
+            m = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
+            return m.group(1).strip() if m else text.strip()
+        return json.dumps({"tests": extract_code(result["completion"]), "model": result["model"], "elapsed": round(time.time()-t0, 1)})
 
     return mcp_server
 
