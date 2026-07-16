@@ -24,6 +24,8 @@ llm_image = (
 
 MODEL_VOL = modal.Volume.from_name("pi-frontend-models", create_if_missing=True)
 COALITION_VOL = modal.Volume.from_name("pi-frontend-coalitions", create_if_missing=True)
+DELTA_VOL = modal.Volume.from_name("pi-frontend-deltas", create_if_missing=True)
+WORKSPACE_VOL = modal.Volume.from_name("pi-frontend-workspace", create_if_missing=True)
 DEFAULT_MODEL = "Qwen/CodeQwen1.5-7B-Chat"
 
 
@@ -419,11 +421,19 @@ def web():
                     )
                     frontier_code = extract_code(frontier_result["content"])
                     if frontier_code != code:
-                        blackboard["delta"] = {"round": round_num, "changed": True, "original": code[:200], "corrected": frontier_code[:200]}
+                        blackboard["delta"] = {"round": round_num, "changed": True, "original": code, "corrected": frontier_code}
+                        await delta_store.remote.aio("record", record={
+                            "goal": goal, "coalition": coalition_selected["coalition"] if coalition_selected else ",".join(ids),
+                            "round": round_num, "proposal": code, "correction": frontier_code,
+                            "delta_changed": True, "frontier_model": frontier_model})
                         code = frontier_code  # use the frontier-corrected version
                         yield f"data: {json.dumps({'event':'frontier_corrected','round':round_num,'model':frontier_model,'delta':True})}\n\n"
                     else:
                         blackboard["delta"] = {"round": round_num, "changed": False}
+                        await delta_store.remote.aio("record", record={
+                            "goal": goal, "coalition": coalition_selected["coalition"] if coalition_selected else ",".join(ids),
+                            "round": round_num, "proposal": code, "correction": code,
+                            "delta_changed": False, "frontier_model": frontier_model})
                         yield f"data: {json.dumps({'event':'frontier_accepted','round':round_num,'model':frontier_model,'delta':False})}\n\n"
 
                 # Phase 6: Verify — run code + tests in sandbox
@@ -471,6 +481,41 @@ def web():
         pool = req.get("pool", DEFAULT_MODEL)
         n = int(req.get("n", 3))
         return await coalition_store.remote.aio("select", pool=pool, n=n)
+
+    # --- Delta accumulation (learning dataset) ---
+    @api.get("/api/deltas")
+    async def deltas_stats():
+        return await delta_store.remote.aio("stats")
+
+    @api.post("/api/deltas/read")
+    async def deltas_read(req: dict):
+        limit = int(req.get("limit", 50))
+        return await delta_store.remote.aio("read", limit=limit)
+
+    # --- Repository workspace ---
+    @api.get("/api/workspace")
+    async def workspace_list():
+        return await workspace.remote.aio("list")
+
+    @api.post("/api/workspace/read")
+    async def workspace_read(req: dict):
+        return await workspace.remote.aio("read", path=req.get("path",""))
+
+    @api.post("/api/workspace/write")
+    async def workspace_write(req: dict):
+        return await workspace.remote.aio("write", path=req.get("path",""), content=req.get("content",""))
+
+    @api.post("/api/workspace/diff")
+    async def workspace_diff(req: dict):
+        return await workspace.remote.aio("diff", file1=req.get("file1",""), file2=req.get("file2",""))
+
+    @api.post("/api/workspace/snapshot")
+    async def workspace_snapshot(req: dict):
+        return await workspace.remote.aio("snapshot", path=req.get("path",""))
+
+    @api.post("/api/workspace/revert")
+    async def workspace_revert(req: dict):
+        return await workspace.remote.aio("revert", path=req.get("path",""))
 
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
@@ -686,10 +731,18 @@ def build_mcp():
                     f"## Task\n{goal}\n\n## Proposed solution\n{code}")
                 frontier_code = extract_code(fr["content"])
                 if frontier_code != code:
-                    bb["delta"] = {"round": rnd, "changed": True, "original": code[:200], "corrected": frontier_code[:200]}
+                    bb["delta"] = {"round": rnd, "changed": True, "original": code, "corrected": frontier_code}
+                    await delta_store.remote.aio("record", record={
+                        "goal": goal, "coalition": ",".join(ids), "round": rnd,
+                        "proposal": code, "correction": frontier_code,
+                        "delta_changed": True, "frontier_model": frontier_model})
                     code = frontier_code
                 else:
                     bb["delta"] = {"round": rnd, "changed": False}
+                    await delta_store.remote.aio("record", record={
+                        "goal": goal, "coalition": ",".join(ids), "round": rnd,
+                        "proposal": code, "correction": code,
+                        "delta_changed": False, "frontier_model": frontier_model})
             # Verify: run code + tests
             full_code = code + "\n\n# --- tests ---\n" + test_code
             result = await execute_code.remote.aio(full_code, timeout=10)
@@ -718,6 +771,40 @@ def build_mcp():
         Over time, it converges on the coalition that best approximates the frontier.
         """
         result = await coalition_store.remote.aio(action, pool=pool, n=n)
+        return json.dumps(result)
+
+    @mcp_server.tool()
+    async def modal_deltas(action: str = "stats", limit: int = 50) -> str:
+        """Read the persistent delta (learning) dataset.
+
+        Actions:
+        - 'stats': return aggregate stats (total, corrected, accepted, correction_rate, by_coalition)
+        - 'read': return the most recent delta entries (swarm_proposal vs frontier_correction pairs)
+
+        This is the learning signal: every time the frontier model corrects the swarm,
+        the (proposal, correction) pair is recorded. Over time, this builds a preference
+        dataset for fine-tuning. The swarm literally learns from the frontier.
+        """
+        result = await delta_store.remote.aio(action, limit=limit)
+        return json.dumps(result)
+
+    @mcp_server.tool()
+    async def modal_workspace(action: str, path: str = "", content: str = "", file1: str = "", file2: str = "") -> str:
+        """Operate on a persistent repository workspace (file tree on a Modal volume).
+
+        Actions:
+        - 'list': list all files in the workspace
+        - 'read': read a file by path
+        - 'write': write content to a file path
+        - 'delete': delete a file
+        - 'diff': diff two files (file1 vs file2)
+        - 'snapshot': save a .prev version of a file (for revert)
+        - 'revert': revert a file to its .prev snapshot
+
+        This lets the cognition loop operate on real files (tree, diff, apply/revert)
+        instead of just isolated code snippets.
+        """
+        result = await workspace.remote.aio(action, path=path, content=content, file1=file1, file2=file2)
         return json.dumps(result)
 
     @mcp_server.tool()
@@ -965,6 +1052,157 @@ def coalition_store(action: str, coalition: str = "", result: dict = None, pool:
                 "explored": len([k for k in possible_strs if k in stats]),
                 "total_possible": len(possible),
                 "stats": {k: v for k, v in stats.items() if k in possible_strs}}
+
+    return {"error": f"unknown action: {action}"}
+
+
+@app.function(image=base_image, volumes={"/deltas": DELTA_VOL}, timeout=60)
+def delta_store(action: str = "read", record: dict = None, limit: int = 50) -> dict:
+    """Persistent accumulation of (swarm_proposal, frontier_correction) pairs.
+
+    The learning dataset: every time the frontier model corrects the swarm,
+    the pair is recorded. Over time this builds a preference dataset for
+    fine-tuning or prompt optimization. The swarm literally learns from the frontier.
+    """
+    import json, os, time
+    path = "/deltas/corrections.jsonl"
+    os.makedirs("/deltas", exist_ok=True)
+
+    if action == "record":
+        entry = {
+            "timestamp": time.time(),
+            "goal": record.get("goal", ""),
+            "coalition": record.get("coalition", ""),
+            "round": record.get("round", 1),
+            "proposal": record.get("proposal", ""),
+            "correction": record.get("correction", ""),
+            "delta_changed": record.get("delta_changed", False),
+            "frontier_model": record.get("frontier_model", ""),
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        DELTA_VOL.commit()
+        count = 0
+        if os.path.exists(path):
+            with open(path) as f:
+                count = sum(1 for _ in f)
+        return {"recorded": True, "total": count}
+
+    elif action == "read":
+        if not os.path.exists(path):
+            return {"deltas": [], "total": 0}
+        deltas = []
+        with open(path) as f:
+            for line in f:
+                try:
+                    deltas.append(json.loads(line))
+                except:
+                    pass
+        return {"deltas": deltas[-limit:], "total": len(deltas)}
+
+    elif action == "stats":
+        if not os.path.exists(path):
+            return {"total": 0, "corrected": 0, "accepted": 0, "correction_rate": 0}
+        corrected = total = 0
+        coalitions = {}
+        with open(path) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    total += 1
+                    c = d.get("delta_changed", False)
+                    if c:
+                        corrected += 1
+                    coal = d.get("coalition", "unknown")
+                    if coal not in coalitions:
+                        coalitions[coal] = {"total": 0, "corrected": 0}
+                    coalitions[coal]["total"] += 1
+                    if c:
+                        coalitions[coal]["corrected"] += 1
+                    coalitions[coal]["correction_rate"] = round(coalitions[coal]["corrected"] / coalitions[coal]["total"], 3)
+                except:
+                    pass
+        return {"total": total, "corrected": corrected, "accepted": total - corrected,
+                "correction_rate": round(corrected / total, 3) if total else 0,
+                "by_coalition": coalitions}
+
+    return {"error": f"unknown action: {action}"}
+
+
+@app.function(image=base_image, volumes={"/workspace": WORKSPACE_VOL}, timeout=60)
+def workspace(action: str, path: str = "", content: str = "", file1: str = "", file2: str = "") -> dict:
+    """Repository workspace: file tree operations on a Modal volume.
+
+    The cognition loop can operate on real files (tree, read, write, diff,
+    apply/revert) instead of just isolated code snippets.
+    """
+    import os, json, difflib
+    base = "/workspace"
+    os.makedirs(base, exist_ok=True)
+
+    if action == "list":
+        tree = []
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, base)
+                tree.append({"path": rel, "size": os.path.getsize(fp)})
+        return {"files": sorted(tree, key=lambda x: x["path"]), "count": len(tree)}
+
+    elif action == "read":
+        full = os.path.join(base, path)
+        if not os.path.exists(full):
+            return {"error": "not found", "path": path}
+        with open(full) as f:
+            return {"path": path, "content": f.read(), "size": os.path.getsize(full)}
+
+    elif action == "write":
+        full = os.path.join(base, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(content)
+        WORKSPACE_VOL.commit()
+        return {"written": path, "size": len(content)}
+
+    elif action == "delete":
+        full = os.path.join(base, path)
+        if os.path.exists(full):
+            os.remove(full)
+            WORKSPACE_VOL.commit()
+            return {"deleted": path}
+        return {"error": "not found"}
+
+    elif action == "diff":
+        f1 = os.path.join(base, file1)
+        f2 = os.path.join(base, file2)
+        if not os.path.exists(f1) or not os.path.exists(f2):
+            return {"error": "file not found"}
+        with open(f1) as a, open(f2) as b:
+            diff = list(difflib.unified_diff(a.readlines(), b.readlines(),
+                                             fromfile=file1, tofile=file2, lineterm=""))
+        return {"file1": file1, "file2": file2, "diff": "\n".join(diff[:100]), "lines_changed": len(diff)}
+
+    elif action == "snapshot":
+        # Save current state of a file as a .prev version (for revert)
+        full = os.path.join(base, path)
+        if not os.path.exists(full):
+            return {"error": "not found"}
+        prev = full + ".prev"
+        import shutil
+        shutil.copy2(full, prev)
+        WORKSPACE_VOL.commit()
+        return {"snapshotted": path}
+
+    elif action == "revert":
+        full = os.path.join(base, path)
+        prev = full + ".prev"
+        if not os.path.exists(prev):
+            return {"error": "no snapshot"}
+        import shutil
+        shutil.copy2(prev, full)
+        WORKSPACE_VOL.commit()
+        return {"reverted": path}
 
     return {"error": f"unknown action: {action}"}
 
