@@ -1081,6 +1081,8 @@ async def frontier_verify(api_base: str, api_key: str, model: str, system_prompt
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "https://pi-modal-mcp.modal.run",
+        "X-Title": "pi-modal-mcp",
     })
     with urllib.request.urlopen(req, timeout=60) as r:
         result = json.loads(r.read())
