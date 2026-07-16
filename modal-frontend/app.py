@@ -134,7 +134,35 @@ def mcp_web():
         png = await browse_page.remote.aio(url)
         return Image(data=png, format="png")
 
-    return mcp_server.streamable_http_app()
+    return _NoGetStream(mcp_server.streamable_http_app())
+
+
+class _NoGetStream:
+    """ASGI middleware: 405 GET on the MCP path so stateless clients use POST-inline.
+
+    A stateless server has no persistent SSE stream to offer, so advertising one
+    (200 GET that holds open) makes strict clients (e.g. the MCP Node SDK) block
+    on a listening stream that never delivers. Returning 405 tells them to skip
+    the GET stream and use POST-inline responses, which is correct for stateless.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") == "/mcp"
+        ):
+            body = b"GET stream disabled; use POST (stateless mode)"
+            await send({"type": "http.response.start", "status": 405,
+                        "headers": [[b"content-type", b"text/plain"],
+                                     [b"content-length", str(len(body)).encode()],
+                                     [b"allow", b"POST"]]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
 
 
 @app.function(image=base_image)

@@ -90,7 +90,40 @@ asyncio.run(main())
 PY
 ```
 
-### pi (stdio-only) via the shim
+### pi (native remote transport, no shim)
+
+The `mcp-runtime` extension now speaks the remote (streamable-HTTP) MCP
+transport directly, so pi can hit the Modal-hosted MCP server with **zero
+local component**.
+
+1. Install the extension:
+
+```bash
+mkdir -p ~/.pi/agent/extensions/mcp-runtime
+cp mcp-runtime/index.ts mcp-runtime/package.json ~/.pi/agent/extensions/mcp-runtime/
+cd ~/.pi/agent/extensions/mcp-runtime && npm install
+```
+
+2. Add `~/.pi/agent/mcp.json` (replace workspace + URL):
+
+```json
+{
+  "mcpServers": {
+    "modal": {
+      "url": "https://YOUR-WORKSPACE--pi-frontend-mcp-web.modal.run/mcp",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+3. Restart pi (or `/reload`), then `/mcp list` to see `mcp_modal_modal_ping`,
+   `mcp_modal_modal_models`, `mcp_modal_modal_browse` tagged `[remote]`.
+
+### pi (stdio fallback) via the shim
+
+For MCP servers that only expose a stdio interface (or for air-gapped use),
+the `modal-mcp` shim still works:
 
 1. Install the shim on PATH:
 
@@ -99,15 +132,7 @@ cp modal-mcp/run.sh /usr/local/bin/modal-mcp   # or anywhere on PATH
 chmod +x /usr/local/bin/modal-mcp
 ```
 
-2. Configure pi's MCP runtime (see `mcp-runtime/mcp.json.example`):
-
-```bash
-mkdir -p ~/.pi/agent/extensions/mcp-runtime
-cp mcp-runtime/index.ts mcp-runtime/package.json ~/.pi/agent/extensions/mcp-runtime/
-cd ~/.pi/agent/extensions/mcp-runtime && npm install
-```
-
-3. Add `~/.pi/agent/mcp.json` (replace workspace + URL):
+2. Add `~/.pi/agent/mcp.json` using the `command` form instead of `url`:
 
 ```json
 {
@@ -123,8 +148,37 @@ cd ~/.pi/agent/extensions/mcp-runtime && npm install
 }
 ```
 
-4. Restart pi (or `/reload`), then `/mcp list` to see `mcp_modal_modal_ping`,
-   `mcp_modal_modal_models`, `mcp_modal_modal_browse`.
+3. `/mcp list` shows the tools tagged `[stdio]`.
+
+### Why stateless + 405 GET?
+
+Modal load-balances each HTTP request across containers, so stateful MCP
+sessions (which require session affinity) break. The app sets
+`stateless_http=True` and disables DNS-rebinding host checks so any host can
+reach it.
+
+A second subtlety: the MCP **Node** SDK's streamable-HTTP client, on `start()`,
+first tries `GET /mcp` to open a listening SSE stream; if the server returns
+`200` and holds it open, the client blocks waiting for events that a stateless
+server never delivers. A stateless server has no stream to offer, so the app
+wraps the MCP ASGI app in a middleware that returns **`405` for `GET /mcp`**,
+telling strict clients to skip the GET stream and use POST-inline responses.
+This makes the endpoint compatible with the Node SDK, the Python SDK, Claude
+Desktop, and Cursor alike.
+
+For a private deployment, tighten `transport_security.allowed_hosts`.
+
+## Transports
+
+The pi `mcp-runtime` extension supports both backends from one config:
+
+- **stdio** — `{ "command": "...", "args": [...] }` spawns a local process.
+- **remote** — `{ "url": "https://...", "transport": "streamable-http" }`
+  talks to a remote MCP-over-HTTP server directly. `"transport": "sse"`
+  selects the legacy SSE client. Optional `"headers": { ... }` for auth.
+
+Remote transport means pi needs **zero local component** for cloud-hosted MCP
+servers — no shim, no `npx`/Python process to spawn.
 
 ## How many models can I run simultaneously?
 

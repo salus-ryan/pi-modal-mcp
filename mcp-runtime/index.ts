@@ -2,14 +2,24 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+type RemoteTransport = "streamable-http" | "sse";
+
 interface McpServerConfig {
-  command: string;
+  // stdio backend
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
+  // remote backend
+  url?: string;
+  transport?: RemoteTransport;
+  headers?: Record<string, string>;
+  // common
   disabled?: boolean;
 }
 
@@ -20,8 +30,8 @@ interface McpConfig {
 interface ConnectedServer {
   name: string;
   config: McpServerConfig;
+  backend: "stdio" | "remote";
   client: Client;
-  transport: StdioClientTransport;
   tools: any[];
 }
 
@@ -83,16 +93,34 @@ export default function mcpRuntime(pi: ExtensionAPI) {
 
     for (const [name, serverConfig] of configured) {
       try {
-        const client = new Client({ name: "pi-mcp-runtime", version: "0.1.0" });
-        const transport = new StdioClientTransport({
-          command: serverConfig.command,
-          args: serverConfig.args ?? [],
-          env: { ...process.env, ...(serverConfig.env ?? {}) } as Record<string, string>,
-          cwd: serverConfig.cwd,
-        });
+        const client = new Client({ name: "pi-mcp-runtime", version: "0.2.0" });
+        let backend: "stdio" | "remote";
+        let transport: any;
+        if (serverConfig.url) {
+          backend = "remote";
+          const t: RemoteTransport = serverConfig.transport ?? "streamable-http";
+          const requestInit: Record<string, unknown> = {};
+          if (serverConfig.headers) requestInit.headers = serverConfig.headers;
+          if (t === "sse") {
+            transport = new SSEClientTransport(new URL(serverConfig.url), requestInit as any);
+          } else {
+            transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), requestInit as any);
+          }
+        } else if (serverConfig.command) {
+          backend = "stdio";
+          transport = new StdioClientTransport({
+            command: serverConfig.command,
+            args: serverConfig.args ?? [],
+            env: { ...process.env, ...(serverConfig.env ?? {}) } as Record<string, string>,
+            cwd: serverConfig.cwd,
+          });
+        } else {
+          ctx.ui.notify(`MCP server '${name}' has neither 'url' nor 'command' — skipping`, "error");
+          continue;
+        }
         await client.connect(transport);
         const listed = await client.listTools();
-        const connected: ConnectedServer = { name, config: serverConfig, client, transport, tools: listed.tools ?? [] };
+        const connected: ConnectedServer = { name, config: serverConfig, backend, client, tools: listed.tools ?? [] };
         servers.set(name, connected);
 
         for (const tool of connected.tools) {
@@ -148,7 +176,7 @@ export default function mcpRuntime(pi: ExtensionAPI) {
         return;
       }
       const lines = [...servers.values()].flatMap((server) => [
-        `${server.name} (${server.tools.length} tools)`,
+        `${server.name} [${server.backend}] (${server.tools.length} tools)`,
         ...server.tools.map((tool) => `  ${safeToolName(server.name, tool.name)} -> ${server.name}:${tool.name}`),
       ]);
       ctx.ui.notify(lines.length ? lines.join("\n") : "No MCP servers connected. Create ~/.pi/agent/mcp.json then /mcp reload.", "info");

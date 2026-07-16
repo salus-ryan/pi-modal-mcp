@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "modal": {
-      "command": "modal-mcp",
-      "args": [],
-      "env": {
-        "MODAL_FRONTEND": "https://YOUR-WORKSPACE--pi-frontend-web.modal.run"
-      }
+      "url": "https://YOUR-WORKSPACE--pi-frontend-mcp-web.modal.run/mcp",
+      "transport": "streamable-http"
     }
   }
 }
