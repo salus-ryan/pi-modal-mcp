@@ -1605,121 +1605,176 @@ def cognition_loop(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_round
 
 IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>pi-modal-mcp &middot; swarm IDE</title>
+<title>pi-modal-mcp &middot; agent</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0d1117;color:#e6edf3;height:100vh;display:flex;flex-direction:column}
-  header{background:linear-gradient(90deg,#6366f1,#0ea5e9);padding:10px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  header h1{font-size:15px;color:#fff;font-weight:600}
-  header .sub{font-size:12px;color:#dbeafe}
-  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}
-  .bar label{font-size:11px;color:#dbeafe}
-  .bar input{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:6px;font-size:12px}
-  .bar input[type=number]{width:64px}
-  .bar input[type=text]{width:240px}
-  .bar button{background:#238636;border:1px solid #2ea043;color:#fff;padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
-  .bar button:hover{background:#2ea043}
-  .bar button:disabled{opacity:.5;cursor:wait}
-  main{flex:1;display:flex;min-height:0}
-  #editor{flex:1;min-width:0;border-right:1px solid #30363d}
-  #panel{width:42%;min-width:340px;display:flex;flex-direction:column;background:#0d1117}
-  #panel .phead{padding:8px 12px;border-bottom:1px solid #30363d;font-size:12px;color:#8b949e;display:flex;justify-content:space-between}
-  #results{flex:1;overflow:auto;padding:10px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;overflow:hidden}
-  .card .ctitle{background:#21262d;padding:6px 10px;font-size:11px;color:#79c0ff;display:flex;justify-content:space-between;border-bottom:1px solid #30363d}
-  .card .cbody{padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;color:#c9d1d9}
-  .err{color:#f85149}
-  .status{font-size:11px;color:#8b949e}
+  :root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bd:#30363d;--tx:#e6edf3;--tx2:#8b949e;--acc:#58a6ff;--grn:#3fb950;--red:#f85149;--yel:#d29922;--pur:#bc8cff}
+  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--tx);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  header{background:linear-gradient(90deg,#6366f1,#0ea5e9);padding:8px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+  header h1{font-size:14px;color:#fff;font-weight:600}
+  header .sub{font-size:11px;color:#dbeafe}
+  header .dot{width:8px;height:8px;border-radius:50%;background:var(--grn);margin-left:auto}
+  .main{display:flex;flex:1;min-height:0}
+  /* Left: file tree + editor */
+  .left{width:35%;display:flex;flex-direction:column;border-right:1px solid var(--bd);min-width:280px}
+  .tree{background:var(--bg2);padding:6px 8px;border-bottom:1px solid var(--bd);max-height:35%;overflow:auto;flex-shrink:0}
+  .tree .f{padding:3px 8px;font-size:12px;cursor:pointer;border-radius:4px;color:var(--tx2);font-family:ui-monospace,monospace}
+  .tree .f:hover{background:var(--bg3);color:var(--tx)}
+  .tree .f.active{background:var(--bg3);color:var(--acc)}
+  #editor{flex:1;min-height:0}
+  /* Center: chat */
+  .center{flex:1;display:flex;flex-direction:column;min-width:0}
+  .chat{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:85%;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5}
+  .msg.user{align-self:flex-end;background:#1a1f2e;border:1px solid var(--bd)}
+  .msg.assistant{align-self:flex-start;background:var(--bg2);border:1px solid var(--bd)}
+  .msg.assistant pre{margin-top:6px;background:var(--bg);padding:8px 10px;border-radius:6px;font-size:12px;overflow-x:auto;white-space:pre-wrap}
+  .msg.system{align-self:center;background:transparent;color:var(--tx2);font-size:12px;font-style:italic}
+  .input-bar{padding:10px 16px;border-top:1px solid var(--bd);display:flex;gap:8px;align-items:flex-end}
+  .input-bar textarea{flex:1;background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:8px;padding:8px 12px;font-size:14px;resize:none;height:40px;max-height:120px;font-family:inherit}
+  .input-bar button{background:#6366f1;border:1px solid #7c3aed;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .input-bar button:disabled{opacity:.4;cursor:wait}
+  /* Right: agent activity */
+  .right{width:30%;min-width:260px;display:flex;flex-direction:column;border-left:1px solid var(--bd);background:var(--bg2)}
+  .right .head{padding:8px 12px;border-bottom:1px solid var(--bd);font-size:12px;color:var(--tx2);display:flex;justify-content:space-between;align-items:center}
+  .right .head .spin{width:14px;height:14px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp 0.6s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .feed{flex:1;overflow:auto;padding:8px;display:flex;flex-direction:column;gap:4px}
+  .ev{font-size:11px;font-family:ui-monospace,monospace;padding:4px 8px;border-radius:4px;color:var(--tx2);line-height:1.4}
+  .ev .t{color:var(--tx2);font-size:10px;margin-right:6px}
+  .ev.round{color:var(--pur);font-weight:600}
+  .ev.generate{color:var(--acc)}
+  .ev.candidate{color:var(--tx);background:var(--bg3)}
+  .ev.conflicts{color:var(--yel)}
+  .ev.synth{color:var(--grn)}
+  .ev.frontier{color:var(--pur)}
+  .ev.security{color:var(--yel)}
+  .ev.verify{font-weight:600}
+  .ev.pass{color:var(--grn)}
+  .ev.fail{color:var(--red)}
+  .ev.halt{color:var(--grn);font-weight:bold;font-size:12px}
+  .ev.ws{color:var(--acc)}
 </style></head><body>
 <header>
-  <div><h1>&#129418; pi-modal-mcp swarm IDE</h1><div class=sub>self-hosted OSS models on Modal GPUs &middot; <a href=https://github.com/salus-ryan/pi-modal-mcp target=_blank style=color:#dbeafe>repo</a></div></div>
-  <div class=bar>
-    <label>models <input id=models type=text value="Qwen/CodeQwen1.5-7B-Chat" title="comma-separated HuggingFace IDs"></label>
-    <label>n <input id=n type=number value=3 min=1 max=16></label>
-    <label>tokens <input id=tok type=number value=128 min=8 max=1024></label>
-    <button id=run>Run swarm</button>
-    <button id=cog style='background:#7c3aed;border-color:#6d28d9'>Run cognition</button>
-  </div>
+  <h1>&#129504; pi-modal-mcp agent</h1>
+  <span class=sub>self-hosted OSS swarm on Modal GPUs</span>
+  <span class=dot id=dot></span>
 </header>
-<main>
-  <div id=editor></div>
-  <div id=panel>
-    <div class=phead><span>swarm results</span><span class=status id=status>idle</span></div>
-    <div id=results><div class=card><div class=cbody style=color:#8b949e>Edit code on the left, then "Run swarm". Each worker runs on its own Modal GPU container; results stream back in parallel.</div></div></div>
+<div class=main>
+  <div class=left>
+    <div class=tree id=tree></div>
+    <div id=editor></div>
   </div>
-</main>
+  <div class=center>
+    <div class=chat id=chat></div>
+    <div class=input-bar>
+      <textarea id=msg placeholder="Describe a coding task..." rows=1></textarea>
+      <button id=send>Send</button>
+    </div>
+  </div>
+  <div class=right>
+    <div class=head><span>agent activity</span><span class=spin id=spin style=display:none></span></div>
+    <div class=feed id=feed></div>
+  </div>
+</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
 <script>
+let ed,activeFile='';
 require.config({paths:{vs:'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs'}});
-let ed;
 require(['vs/editor/editor.main'],function(){
-  ed=monaco.editor.create(document.getElementById('editor'),{
-    value:'// OSS model swarm on Modal\\n// Edit me, then hit Run swarm.\\n\\ndef fizzbuzz(n):\\n    for i in range(1, n+1):\\n',
-    language:'python',theme:'vs-dark',automaticLayout:true,fontSize:13
-  });
+  ed=monaco.editor.create(document.getElementById('editor'),{value:'// workspace files load on the left',language:'python',theme:'vs-dark',automaticLayout:true,fontSize:13,readOnly:true});
 });
 const $=id=>document.getElementById(id);
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-$('run').onclick=async function(){
-  if(!ed)return;
-  const btn=this;btn.disabled=true;$('status').textContent='running...';
-  const body={prompt:ed.getValue(),models:$('models').value,n:parseInt($('n').value,10),max_new_tokens:parseInt($('tok').value,10)};
-  $('results').innerHTML='<div class=card><div class=cbody style=color:#8b949e>fanning out '+body.n+' worker(s) on Modal GPUs...</div></div>';
-  try{
-    const r=await fetch('/api/swarm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const d=await r.json();
-    $('status').textContent='done in '+d.elapsed+'s ('+d.concurrent+' workers)';
-    $('results').innerHTML=d.results.map((x,i)=>'<div class=card><div class=ctitle><span>#'+(i+1)+' '+esc(x.model)+'</span><span>'+(x.elapsed?x.elapsed+'s':'')+'</span></div><div class=cbody'+(x.error?' style=color:#f85149':'')+'>'+esc(x.error||x.completion)+'</div></div>').join('');
-  }catch(e){$('status').textContent='error';$('results').innerHTML='<div class=card><div class=cbody style=color:#f85149>'+esc(String(e))+'</div></div>';}
-  finally{btn.disabled=false;}
-};
-$('cog').onclick=async function(){
-  if(!ed)return;
-  const btn=this;btn.disabled=true;$('status').textContent='cognition running...';
-  const body={goal:ed.getValue(),n:parseInt($('n').value,10),max_rounds:3,max_new_tokens:parseInt($('tok').value,10)};
-  $('results').innerHTML='<div class=card><div class=cbody style=color:#8b949e>Starting 7-phase cognition loop (generate / conflict / test / critique / frontier / security / verify)...</div></div>';
-  const cards=[];
+function now(){return new Date().toLocaleTimeString('en',{hour12:false}).slice(0,8);}
+// File tree
+async function loadTree(){
+  try{const r=await fetch('/api/workspace');const d=await r.json();
+    $('tree').innerHTML=d.files.map(f=>'<div class=f data-p='+esc(f.path)+'>'+esc(f.path)+'</div>').join('');
+    document.querySelectorAll('.tree .f').forEach(el=>el.onclick=()=>openFile(el.dataset.p));
+  }catch(e){}
+}
+async function openFile(path){
+  activeFile=path;
+  document.querySelectorAll('.tree .f').forEach(el=>el.classList.toggle('active',el.dataset.p===path));
+  try{const r=await fetch('/api/workspace/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();
+    if(d.content!==undefined){ed.setValue(d.content);ed.updateOptions({readOnly:false});}
+  }catch(e){}
+}
+// Chat
+function addMsg(role,text){
+  const div=document.createElement('div');div.className='msg '+role;
+  // Render code blocks
+  const parts=text.split(/```/);
+  let html='';
+  for(let i=0;i<parts.length;i++){html+=i%2===1?'<pre>'+esc(parts[i])+'</pre>':esc(parts[i]);}
+  div.innerHTML=html||esc(text);
+  $('chat').appendChild(div);$('chat').scrollTop=$('chat').scrollHeight;
+}
+// Activity feed
+function addEvent(cls,text){
+  const div=document.createElement('div');div.className='ev '+cls;
+  div.innerHTML='<span class=t>'+now()+'</span>'+esc(text);
+  $('feed').appendChild(div);$('feed').scrollTop=$('feed').scrollHeight;
+}
+// Agent: send task, stream cognition events, apply results
+let busy=false;
+$('send').onclick=sendTask;
+$('msg').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendTask();}};
+async function sendTask(){
+  const task=$('msg').value.trim();if(!task||busy)return;
+  busy=true;$('send').disabled=true;$('spin').style.display='inline-block';$('dot').style.background='var(--yel)';
+  $('msg').value='';
+  addMsg('user',task);
+  addMsg('system','agent starting cognition loop...');
+  addEvent('round','\u2192 task: '+task.slice(0,60));
+  const body={goal:task,n:2,max_rounds:3,max_new_tokens:128,workspace_path:activeFile||undefined};
   try{
     const r=await fetch('/api/cognition',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const reader=r.body.getReader();
-    const dec=new TextDecoder();
-    let buf='';
+    const reader=r.body.getReader();const dec=new TextDecoder();let buf='';let haltReason='';let synthCode='';
     while(true){
-      const{done,value}=await reader.read();
-      if(done)break;
+      const{done,value}=await reader.read();if(done)break;
       buf+=dec.decode(value,{stream:true});
-      const lines=buf.split('\n');
-      buf=lines.pop();
+      const lines=buf.split('\n');buf=lines.pop();
       for(const line of lines){
         if(!line.startsWith('data: '))continue;
-        const d=line.slice(6).trim();
-        if(d==='[DONE]')continue;
+        const d=line.slice(6).trim();if(d==='[DONE]')continue;
         try{
-          const e=JSON.parse(d);
-          const ev=e.event||'';const r=e.round||'';
-          let html='';
-          if(ev==='round_start')html='<div class=card><div class=ctitle><span>Round '+r+'</span><span>start</span></div><div class=cbody>Starting round '+r+' of '+e.max_rounds+'</div></div>';
-          else if(ev==='generate')html='<div class=card><div class=cbody style=color:#79c0ff>[R'+r+'] generating: worker '+e.worker+' role='+e.role+'</div></div>';
-          else if(ev==='candidate')html='<div class=card><div class=ctitle><span>R'+r+' candidate '+e.worker+'</span></span></div><div class=cbody>'+esc(e.content||'')+'</div></div>';
-          else if(ev==='conflicts')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] conflicts detected: '+e.count+'</div></div>';
-          else if(ev==='tests')html='<div class=card><div class=ctitle><span>R'+r+' tests</span></div><div class=cbody>'+esc(e.content||'')+'</div></div>';
-          else if(ev==='synthesize')html='<div class=card><div class=ctitle><span>R'+r+' synthesis</span></div><div class=cbody style=color:#16a34a>'+esc(e.content||'')+'</div></div>';
-          else if(ev==='frontier_verify_start')html='<div class=card><div class=cbody style=color:#a78bfa>[R'+r+'] frontier verifying ('+e.model+')...</div></div>';
-          else if(ev==='frontier_corrected')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] frontier CORRECTED</div></div>';
-          else if(ev==='frontier_accepted')html='<div class=card><div class=cbody style=color:#16a34a>[R'+r+'] frontier accepted</div></div>';
-          else if(ev==='security_review_start')html='<div class=card><div class=cbody style=color:#a78bfa>[R'+r+'] security review...</div></div>';
-          else if(ev==='security_corrected')html='<div class=card><div class=cbody style=color:#f59e0b>[R'+r+'] security CORRECTED</div></div>';
-          else if(ev==='security_passed')html='<div class=card><div class=cbody style=color:#16a34a>[R'+r+'] security passed</div></div>';
-          else if(ev==='verify_result')html='<div class=card><div class=cbody style=color:'+(e.passed?'#16a34a':'#f85149')+';font-weight:bold>[R'+r+'] '+(e.passed?'PASS':'FAIL')+' out='+(e.stdout||'').slice(0,30)+'</div></div>';
-          else if(ev==='workspace_applied')html='<div class=card><div class=cbody style=color:#0ea5e9>[R'+r+'] applied to workspace: '+e.path+'</div></div>';
-          else if(ev==='halt'){$('status').textContent='halt: '+e.reason+' ('+e.elapsed+'s)';html='<div class=card><div class=ctitle><span>HALT</span><span>'+e.reason+'</span></div><div class=cbody style=color:#16a34a;font-weight:bold>'+e.reason+' after '+e.elapsed+'s, round '+e.round+'</div></div>';}
-          if(html){cards.push(html);$('results').innerHTML=cards.join('');
-            const panel=document.getElementById('results');panel.scrollTop=panel.scrollHeight;}
+          const e=JSON.parse(d);const ev=e.event||'';const r=e.round||'';
+          if(ev==='round_start')addEvent('round','R'+r+'/'+e.max_rounds+' starting');
+          else if(ev==='generate')addEvent('generate','generating: '+e.role+' (worker '+e.worker+')');
+          else if(ev==='candidate')addEvent('candidate','candidate '+e.worker+': '+(e.content||'').slice(0,50));
+          else if(ev==='conflicts')addEvent('conflicts',e.count+' conflict(s) detected');
+          else if(ev==='tests')addEvent('synth','tests: '+(e.content||'').slice(0,50));
+          else if(ev==='synthesize'){addEvent('synth','synthesis: '+(e.content||'').slice(0,60));synthCode=e.content||'';}
+          else if(ev==='frontier_verify_start')addEvent('frontier','frontier verifying ('+e.model+')...');
+          else if(ev==='frontier_corrected')addEvent('frontier','\u26a0 frontier CORRECTED (delta)');
+          else if(ev==='frontier_accepted')addEvent('frontier','\u2713 frontier accepted');
+          else if(ev==='security_review_start')addEvent('security','security review...');
+          else if(ev==='security_corrected')addEvent('security','\u26a0 security fix applied');
+          else if(ev==='security_passed')addEvent('security','\u2713 security passed');
+          else if(ev==='verify_result')addEvent(e.passed?'pass':'fail',(e.passed?'\u2713 PASS':'\u2717 FAIL')+(e.stdout?' out='+e.stdout.slice(0,20):''));
+          else if(ev==='workspace_applied')addEvent('ws','\u2713 applied to '+e.path);
+          else if(ev==='halt'){haltReason=e.reason;addEvent('halt','\u25a0 HALT: '+e.reason+' ('+e.elapsed+'s, R'+e.round+')');}
         }catch(err){}
       }
     }
-  }catch(e){$('status').textContent='error';$('results').innerHTML='<div class=card><div class=cbody style=color:#f85149>'+esc(String(e))+'</div></div>';}
-  finally{btn.disabled=false;}
-};
+    // Show result in chat
+    if(haltReason==='verified'&&synthCode){
+      addMsg('assistant','Done! Verified in sandbox. Applied to '+activeFile+'.\n```python\n'+synthCode+'\n```');
+    }else if(haltReason==='max_rounds'){
+      addMsg('assistant','Reached max rounds without verification. The code may need manual review.\n```python\n'+synthCode+'\n```');
+    }else{
+      addMsg('assistant','Cognition loop completed ('+haltReason+').');
+    }
+    loadTree(); // refresh file tree
+    if(activeFile)openFile(activeFile); // reload editor with changes
+  }catch(e){
+    addMsg('assistant','Error: '+e);
+  }finally{
+    busy=false;$('send').disabled=false;$('spin').style.display='none';$('dot').style.background='var(--grn)';
+  }
+}
+loadTree();
 </script>
 </body></html>"""
