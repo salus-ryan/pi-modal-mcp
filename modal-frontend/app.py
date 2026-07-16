@@ -298,6 +298,87 @@ def web():
             "synthesis": synth,
         }
 
+    # --- Swarm cognition loop: multi-round generate → critique → verify → (retry or halt) ---
+    @api.post("/api/cognition")
+    async def cognition(req: dict):
+        from fastapi.responses import StreamingResponse
+        import re
+        goal = req.get("goal", req.get("prompt", ""))
+        models = req.get("models", DEFAULT_MODEL)
+        n = max(1, min(int(req.get("n", 3)), 8))
+        max_rounds = max(1, min(int(req.get("max_rounds", 3)), 5))
+        max_new = int(req.get("max_new_tokens", 256))
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+
+        ROLE_PROMPTS = {
+            "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code, no markdown.",
+            "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
+            "critic": "You are a senior code reviewer. Review the candidates, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+        }
+
+        def extract_code(text):
+            match = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
+            return match.group(1).strip() if match else text.strip()
+
+        blackboard = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
+                      "conflicts": [], "constraints": [], "verifications": [],
+                      "synthesis": None, "halted": False, "halt_reason": None}
+        t0 = time.time()
+
+        async def generate():
+            for round_num in range(1, max_rounds + 1):
+                blackboard["round"] = round_num
+                yield f"data: {json.dumps({'event':'round_start','round':round_num,'max_rounds':max_rounds,'elapsed':round(time.time()-t0,1)})}\n\n"
+
+                prompt = goal
+                if blackboard["constraints"]:
+                    ct = "\n".join(f"  - {c}" for c in blackboard["constraints"])
+                    prompt = f"{goal}\n\n## Previous failures:\n{ct}\n\nFix and write the complete solution."
+
+                candidates = []
+                for i in range(n):
+                    role = "planner" if (i == 0 and n > 1) else "coder"
+                    rp = ROLE_PROMPTS.get(role, ROLE_PROMPTS["coder"])
+                    yield f"data: {json.dumps({'event':'generate','worker':i,'model':ids[i%len(ids)],'role':role,'round':round_num})}\n\n"
+                    result = await llm_worker.remote.aio(ids[i % len(ids)], f"{rp}\n\n## Task\n{prompt}", max_new)
+                    candidates.append(result)
+                    blackboard["claims"].append({"id":f"r{round_num}c{i}","model":result["model"],"role":role,"content":result["completion"],"round":round_num})
+                    yield f"data: {json.dumps({'event':'candidate','worker':i,'round':round_num,'content':result['completion'][:300]})}\n\n"
+
+                cand_text = "\n\n---\n\n".join(f"### Candidate {i+1} ({c['model']}):\n{c['completion']}" for i,c in enumerate(candidates))
+                yield f"data: {json.dumps({'event':'critique_start','round':round_num})}\n\n"
+                synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:", max_new)
+                code = extract_code(synth["completion"])
+                blackboard["synthesis"] = code
+                yield f"data: {json.dumps({'event':'synthesize','round':round_num,'content':code[:500]})}\n\n"
+
+                yield f"data: {json.dumps({'event':'verify_start','round':round_num,'code':code[:300]})}\n\n"
+                result = await execute_code.remote.aio(code, timeout=10)
+                blackboard["verifications"].append({"round":round_num,"code":code,"result":result})
+                yield f"data: {json.dumps({'event':'verify_result','round':round_num,'passed':result['passed'],'stdout':result['stdout'][:500],'stderr':result['stderr'][:500]})}\n\n"
+
+                if result["passed"]:
+                    blackboard["halted"] = True; blackboard["halt_reason"] = "verified"
+                    yield f"data: {json.dumps({'event':'halt','reason':'verified','round':round_num,'elapsed':round(time.time()-t0,1),'blackboard':blackboard})}\n\n"
+                    yield "data: [DONE]\n\n"; return
+                else:
+                    err = result["stderr"][:500] if result["stderr"] else f"exit {result['exit_code']}"
+                    blackboard["constraints"].append(f"Round {round_num}: {err}")
+                    yield f"data: {json.dumps({'event':'round_end','round':round_num,'passed':False,'elapsed':round(time.time()-t0,1)})}\n\n"
+
+            blackboard["halted"] = True; blackboard["halt_reason"] = "max_rounds"
+            yield f"data: {json.dumps({'event':'halt','reason':'max_rounds','round':max_rounds,'elapsed':round(time.time()-t0,1),'blackboard':blackboard})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    @api.post("/api/verify")
+    async def verify(req: dict):
+        code = req.get("code", "")
+        timeout = int(req.get("timeout", 10))
+        result = await execute_code.remote.aio(code, timeout)
+        return result
+
     # --- Modal-hosted MCP server (mounted) ---
     api.mount("/mcp", _NoGetStream(build_mcp().streamable_http_app()))
 
@@ -418,6 +499,73 @@ def build_mcp():
         return json.dumps({"elapsed": round(time.time() - t0, 3),
                            "candidates": [c if not isinstance(c, Exception) else {"error": str(c)} for c in candidates],
                            "synthesis": synth})
+
+    @mcp_server.tool()
+    async def modal_verify(code: str, timeout: int = 10) -> str:
+        """Execute Python code in a Modal sandbox and return the result.
+
+        Returns JSON: {exit_code, stdout, stderr, passed}.
+        The code runs in an isolated container with a timeout (default 10s).
+        """
+        result = await execute_code.remote.aio(code, timeout)
+        return json.dumps(result)
+
+    @mcp_server.tool()
+    async def modal_cognition(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_rounds: int = 3, max_new_tokens: int = 256) -> str:
+        """Run the full swarm cognition loop: multi-round generate -> critique -> synthesize -> verify.
+
+        Each round:
+        1. N workers (coder/planner roles) generate candidate solutions in parallel.
+        2. A critic reviews all candidates and synthesizes ONE canonical answer.
+        3. The synthesized code is executed in a sandbox (verification).
+        4. If it passes -> halt with 'verified'. If it fails -> error fed back as constraint, next round revises.
+
+        Returns JSON: the final blackboard (SCL-inspired shared state) with all
+        rounds, claims, constraints, verifications, synthesis, and halt state.
+        """
+        import re, time
+        ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+        ROLE_PROMPTS = {
+            "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code.",
+            "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
+            "critic": "You are a senior code reviewer. Review candidates, fix bugs, output ONE final correct Python solution. Output ONLY the Python code.",
+        }
+        def extract_code(text):
+            m = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
+            return m.group(1).strip() if m else text.strip()
+        bb = {"goal": goal, "round": 0, "max_rounds": max_rounds, "claims": [],
+              "conflicts": [], "constraints": [], "verifications": [],
+              "synthesis": None, "halted": False, "halt_reason": None}
+        t0 = time.time()
+        for rnd in range(1, max_rounds + 1):
+            bb["round"] = rnd
+            prompt = goal
+            if bb["constraints"]:
+                ct = "\n".join(f"  - {c}" for c in bb["constraints"])
+                prompt = f"{goal}\n\n## Previous failures:\n{ct}\n\nFix and write the complete solution."
+            candidates = []
+            for i in range(n):
+                role = "planner" if (i == 0 and n > 1) else "coder"
+                rp = ROLE_PROMPTS.get(role, ROLE_PROMPTS["coder"])
+                result = await llm_worker.remote.aio(ids[i % len(ids)], f"{rp}\n\n## Task\n{prompt}", max_new_tokens)
+                candidates.append(result)
+                bb["claims"].append({"id": f"r{rnd}c{i}", "model": result["model"], "role": role, "content": result["completion"], "round": rnd})
+            cand_text = "\n\n---\n\n".join(f"### Candidate {i+1} ({c['model']}):\n{c['completion']}" for i,c in enumerate(candidates))
+            synth = await llm_worker.remote.aio(ids[0], f"{ROLE_PROMPTS['critic']}\n\n## Task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:", max_new_tokens)
+            code = extract_code(synth["completion"])
+            bb["synthesis"] = code
+            result = await execute_code.remote.aio(code, timeout=10)
+            bb["verifications"].append({"round": rnd, "code": code, "result": result})
+            if result["passed"]:
+                bb["halted"] = True; bb["halt_reason"] = "verified"
+                break
+            else:
+                err = result["stderr"][:500] if result["stderr"] else f"exit {result['exit_code']}"
+                bb["constraints"].append(f"Round {rnd}: {err}")
+        else:
+            bb["halted"] = True; bb["halt_reason"] = "max_rounds"
+        bb["elapsed"] = round(time.time() - t0, 1)
+        return json.dumps(bb)
 
     return mcp_server
 
@@ -549,6 +697,149 @@ def llm_worker_stream(model_id: str, prompt: str, max_new_tokens: int = 256):
     thread.join()
     MODEL_VOL.commit()
     yield {"done": True, "elapsed": round(time.time() - t0, 3), "model": model_id}
+
+
+@app.function(image=modal.Image.debian_slim(python_version="3.11"), timeout=60, cpu=1, memory=512)
+def execute_code(code: str, timeout: int = 10) -> dict:
+    """Execute Python code in an isolated Modal sandbox.
+
+    Runs the code via subprocess with a timeout. No network calls, no GPU.
+    Returns {exit_code, stdout, stderr, passed}.
+    """
+    import subprocess, tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+        f.write(code)
+        path = f.name
+    try:
+        r = subprocess.run(
+            ["python3", path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return {
+            "exit_code": r.returncode,
+            "stdout": r.stdout[:4000],
+            "stderr": r.stderr[:4000],
+            "passed": r.returncode == 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {timeout}s", "passed": False}
+    except Exception as e:
+        return {"exit_code": -1, "stdout": "", "stderr": str(e), "passed": False}
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@app.function(image=base_image, timeout=900)
+def cognition_loop(goal: str, models: str = DEFAULT_MODEL, n: int = 3, max_rounds: int = 3, max_new_tokens: int = 256):
+    """The swarm cognition loop: generate → critique → synthesize → verify → (retry or halt).
+
+    A Modal generator function that yields cognition events as a structured stream.
+    The blackboard (SCL-inspired shared state) tracks goals, claims, conflicts,
+    constraints, verifications, and halt state.
+
+    Yields event dicts: {event, round, ...details}
+    """
+    import re, json, time
+
+    ids = [m.strip() for m in models.split(",") if m.strip()] or [DEFAULT_MODEL]
+
+    ROLE_PROMPTS = {
+        "coder": "You are an expert Python programmer. Write clean, correct, complete code. Output ONLY the Python code, no markdown, no explanations.",
+        "planner": "You are a technical planner. Think through the approach, then write the complete Python solution. Output ONLY the Python code.",
+        "critic": "You are a senior code reviewer. Review the candidates below, identify the best approach, fix any bugs, and output ONE final correct Python solution. Output ONLY the Python code.",
+    }
+
+    def extract_code(text):
+        match = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text.strip()
+
+    blackboard = {
+        "goal": goal,
+        "round": 0,
+        "max_rounds": max_rounds,
+        "claims": [],
+        "conflicts": [],
+        "constraints": [],
+        "verifications": [],
+        "synthesis": None,
+        "halted": False,
+        "halt_reason": None,
+    }
+
+    t0 = time.time()
+
+    for round_num in range(1, max_rounds + 1):
+        blackboard["round"] = round_num
+        yield {"event": "round_start", "round": round_num, "max_rounds": max_rounds, "elapsed": round(time.time()-t0, 1)}
+
+        # Phase 1: Generate candidates (role specialization)
+        prompt = goal
+        if blackboard["constraints"]:
+            constraint_text = "\n".join(f"  - {c}" for c in blackboard["constraints"])
+            prompt = f"{goal}\n\n## Previous attempts failed with these errors:\n{constraint_text}\n\nFix these issues and write the complete solution."
+
+        candidates = []
+        for i in range(n):
+            # First worker is planner (if n>1), rest are coders
+            role = "planner" if (i == 0 and n > 1) else "coder"
+            role_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS["coder"])
+            full_prompt = f"{role_prompt}\n\n## Task\n{prompt}"
+            yield {"event": "generate", "worker": i, "model": ids[i % len(ids)], "role": role, "round": round_num}
+            result = llm_worker.remote(ids[i % len(ids)], full_prompt, max_new_tokens)
+            candidates.append(result)
+            blackboard["claims"].append({
+                "id": f"r{round_num}c{i}",
+                "model": result["model"],
+                "role": role,
+                "content": result["completion"],
+                "round": round_num,
+            })
+            yield {"event": "candidate", "worker": i, "round": round_num, "content": result["completion"][:300]}
+
+        # Phase 2: Critic reviews and synthesizes
+        cand_text = "\n\n---\n\n".join(
+            f"### Candidate {i+1} ({c['model']}, role={c.get('role','coder')}):\n{c['completion']}"
+            for i, c in enumerate(candidates)
+        )
+        synth_prompt = f"{ROLE_PROMPTS['critic']}\n\n## Original task\n{goal}\n\n## Candidates\n{cand_text}\n\n## Final solution:"
+        yield {"event": "critique_start", "round": round_num}
+        synth = llm_worker.remote(ids[0], synth_prompt, max_new_tokens)
+        code = extract_code(synth["completion"])
+        blackboard["synthesis"] = code
+        yield {"event": "synthesize", "round": round_num, "content": code[:500]}
+
+        # Phase 3: Verify (execute the code in sandbox)
+        yield {"event": "verify_start", "round": round_num, "code": code[:300]}
+        result = execute_code.remote(code, timeout=10)
+        blackboard["verifications"].append({
+            "round": round_num,
+            "code": code,
+            "result": result,
+        })
+        yield {"event": "verify_result", "round": round_num, "passed": result["passed"],
+               "stdout": result["stdout"][:500], "stderr": result["stderr"][:500]}
+
+        if result["passed"]:
+            blackboard["halted"] = True
+            blackboard["halt_reason"] = "verified"
+            yield {"event": "halt", "reason": "verified", "round": round_num,
+                   "elapsed": round(time.time()-t0, 1), "blackboard": blackboard}
+            return
+        else:
+            error_msg = result["stderr"][:500] if result["stderr"] else f"exit code {result['exit_code']}"
+            blackboard["constraints"].append(f"Round {round_num}: execution failed — {error_msg}")
+            yield {"event": "round_end", "round": round_num, "passed": False,
+                   "elapsed": round(time.time()-t0, 1)}
+
+    blackboard["halted"] = True
+    blackboard["halt_reason"] = "max_rounds"
+    yield {"event": "halt", "reason": "max_rounds", "round": max_rounds,
+           "elapsed": round(time.time()-t0, 1), "blackboard": blackboard}
 
 
 IDE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
