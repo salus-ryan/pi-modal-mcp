@@ -1323,6 +1323,31 @@ def delta_store(action: str = "read", record: dict = None, limit: int = 50) -> d
                 "correction_rate": round(corrected / total, 3) if total else 0,
                 "by_coalition": coalitions}
 
+    elif action == "prepare_training":
+        # Convert deltas to instruction-tuning format (goal -> correction)
+        if not os.path.exists(path):
+            return {"examples": 0, "total": 0}
+        examples = []
+        with open(path) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get("delta_changed"):
+                        examples.append({
+                            "instruction": d.get("goal", ""),
+                            "input": "",
+                            "output": d.get("correction", ""),
+                            "coalition": d.get("coalition", ""),
+                        })
+                except:
+                    pass
+        train_path = "/deltas/training.jsonl"
+        with open(train_path, "w") as f:
+            for ex in examples:
+                f.write(json.dumps(ex) + "\n")
+        DELTA_VOL.commit()
+        return {"examples": len(examples), "path": train_path, "format": "instruction_tuning"}
+
     return {"error": f"unknown action: {action}"}
 
 
